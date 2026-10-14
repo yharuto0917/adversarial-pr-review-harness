@@ -1,0 +1,39 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+catalog:
+  # 共通ツールチェーン
+  typescript: ^5.9.0
+  vitest: ^4.1.0
+  "@biomejs/biome": ^2.5.12
+  "@types/node": ^22.20.1
+
+  # ドメインロジック (Cloudflare 非依存)
+  zod: ^4.0.0
+  ai: ^5.0.0
+  "@ai-sdk/google": ^2.0.0
+  "@octokit/rest": ^22.0.1
+  "@octokit/auth-app": ^8.3.1
+
+  # Cloudflare Workers
+  wrangler: ^4.130.0
+  hono: ^4.13.7
+  "@cloudflare/sandbox": ^0.12.9
+  "@cloudflare/workers-types": ^5.20260908.1
+  "@cloudflare/vitest-plugin": ^1.1.6
+
+  # dashboard (Next.js + OpenNext)
+  next: ^16.3.4
+  react: ^19.2.8
+  react-dom: ^19.2.8
+  "@types/react": ^19.2.18
+  "@types/react-dom": ^19.2.7
+  "@opennextjs/cloudflare": ^1.20.6
+
+# ネイティブバイナリを postinstall で配置するため許可する
+#   esbuild: vitest/vite が依存
+#   workerd: wrangler の Workers ランタイム
+allowBuilds:
+  esbuild: true
+  workerd: true

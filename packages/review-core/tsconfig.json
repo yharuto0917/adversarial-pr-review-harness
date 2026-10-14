@@ -1,0 +1,9 @@
+{
+  "extends": "@repo/config/base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"]
+}
