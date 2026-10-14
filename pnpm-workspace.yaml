@@ -11,14 +11,16 @@ catalog:
 
   # ドメインロジック (Cloudflare 非依存)
   zod: ^4.0.0
-  ai: ^5.0.0
-  "@ai-sdk/google": ^2.0.0
+  "@earendil-works/pi-ai": ^1.2.0
+  "@earendil-works/pi-durable": ^1.2.0
+  "@earendil-works/chord": ^1.2.0
   "@octokit/rest": ^22.0.1
   "@octokit/auth-app": ^8.3.1
 
   # Cloudflare Workers
   wrangler: ^4.130.0
   hono: ^4.13.7
+  agents: ^0.28.0
   "@cloudflare/sandbox": ^0.12.9
   "@cloudflare/workers-types": ^5.20260908.1
   "@cloudflare/vitest-plugin": ^1.1.6
@@ -34,6 +36,10 @@ catalog:
 # ネイティブバイナリを postinstall で配置するため許可する
 #   esbuild: vitest/vite が依存
 #   workerd: wrangler の Workers ランタイム
+#   以下は pi-ai / pi-durable の推移的依存。postinstall が無くても動くため実行しない
 allowBuilds:
   esbuild: true
   workerd: true
+  "@google/genai": false
+  core-js-pure: false
+  protobufjs: false

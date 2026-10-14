@@ -1,4 +1,6 @@
-import { Sandbox } from "@cloudflare/sandbox";
+import { WorkerEntrypoint } from "cloudflare:workers";
+import { getSandbox, Sandbox } from "@cloudflare/sandbox";
+import type { ExecResult, SandboxService } from "@repo/harness";
 
 /**
  * レビュー実行用の Sandbox サブクラス。
@@ -10,12 +12,38 @@ import { Sandbox } from "@cloudflare/sandbox";
  */
 export class ReviewSandbox extends Sandbox {}
 
+/**
+ * gateway の Durable Object から service binding 経由で呼ばれる RPC の入口。
+ * Pi のツール（exec / read_file / write_file / list_files）の実体がここになる。
+ */
+export class SandboxEntrypoint extends WorkerEntrypoint<Env> implements SandboxService {
+  async exec(sandboxId: string, command: string): Promise<ExecResult> {
+    const { stdout, stderr, exitCode } = await this.#sandbox(sandboxId).exec(command);
+    return { stdout, stderr, exitCode };
+  }
+
+  async readFile(sandboxId: string, path: string): Promise<string> {
+    const file = await this.#sandbox(sandboxId).readFile(path);
+    return file.content;
+  }
+
+  async writeFile(sandboxId: string, path: string, content: string): Promise<void> {
+    await this.#sandbox(sandboxId).writeFile(path, content);
+  }
+
+  async listFiles(sandboxId: string, path: string): Promise<string[]> {
+    const listing = await this.#sandbox(sandboxId).listFiles(path);
+    return listing.files.map((file) => file.name);
+  }
+
+  #sandbox(sandboxId: string) {
+    return getSandbox(this.env.Sandbox, sandboxId);
+  }
+}
+
 export default {
+  // 公開する HTTP の口は無い。呼び出しはすべて SandboxEntrypoint への RPC で受ける
   async fetch(): Promise<Response> {
-    // TODO: gateway からの service binding 経由でレビュー実行を受け付ける
-    return new Response(JSON.stringify({ ok: false, reason: "not implemented" }), {
-      status: 501,
-      headers: { "content-type": "application/json" },
-    });
+    return new Response(null, { status: 404 });
   },
 } satisfies ExportedHandler<Env>;

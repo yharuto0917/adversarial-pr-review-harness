@@ -19,7 +19,9 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "catalog:",
+    "@earendil-works/pi-ai": "catalog:",
     "@repo/config": "workspace:*",
+    "@repo/harness": "workspace:*",
     "@types/node": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:",

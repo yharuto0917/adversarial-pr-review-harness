@@ -6,7 +6,7 @@
   "exports": {
     ".": "./dist/index.js",
     "./ports": "./dist/ports.js",
-    "./tools": "./dist/tools/registry.js"
+    "./tools": "./dist/tools/extension.js"
   },
   "types": "./dist/index.d.ts",
   "scripts": {
@@ -16,12 +16,12 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "@ai-sdk/google": "catalog:",
-    "@repo/review-core": "workspace:*",
-    "ai": "catalog:",
-    "zod": "catalog:"
+    "@earendil-works/pi-ai": "catalog:",
+    "@earendil-works/pi-durable": "catalog:",
+    "@repo/review-core": "workspace:*"
   },
   "devDependencies": {
+    "@earendil-works/chord": "catalog:",
     "@repo/config": "workspace:*",
     "@types/node": "catalog:",
     "typescript": "catalog:",
