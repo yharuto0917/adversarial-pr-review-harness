@@ -88,7 +88,9 @@ function oauthCredentialProblem(value: unknown): string | undefined {
   if (typeof value !== "object" || value === null) return "credential must be an object";
   const credential = value as Record<string, unknown>;
   if (credential.type !== "oauth") return 'credential.type must be "oauth"';
-  for (const field of ["access", "refresh"] as const) {
+  // clientId はログイン時に OpenAI が発行するもので、これが無いとトークンを更新できない。
+  // 登録時に弾かないと、最初の期限切れまで不備に気づけない
+  for (const field of ["access", "refresh", "clientId"] as const) {
     if (typeof credential[field] !== "string" || credential[field] === "") {
       return `credential.${field} must be a non-empty string`;
     }

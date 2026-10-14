@@ -89,6 +89,16 @@ describe("CredentialVault", () => {
     await expect(vault.status()).resolves.toEqual([]);
   });
 
+  it("更新に必要な clientId が無い認証情報は登録できない", async () => {
+    const vault = env.VAULT.getByName("no-client-id");
+    const { clientId: _clientId, ...withoutClientId } = expired;
+
+    const result = await vault.importCredential("openai", withoutClientId);
+
+    expect(result).toEqual({ ok: false, reason: "credential.clientId must be a non-empty string" });
+    await expect(vault.status()).resolves.toEqual([]);
+  });
+
   it("API キー形式の認証情報は登録できない", async () => {
     const vault = env.VAULT.getByName("invalid");
 
