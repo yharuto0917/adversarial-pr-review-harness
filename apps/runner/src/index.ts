@@ -12,11 +12,15 @@ import type { ExecResult, SandboxService } from "@repo/harness";
  */
 export class ReviewSandbox extends Sandbox {}
 
+export interface RunnerEnv {
+  readonly Sandbox: DurableObjectNamespace<ReviewSandbox>;
+}
+
 /**
  * gateway の Durable Object から service binding 経由で呼ばれる RPC の入口。
  * Pi のツール（exec / read_file / write_file / list_files）の実体がここになる。
  */
-export class SandboxEntrypoint extends WorkerEntrypoint<Env> implements SandboxService {
+export class SandboxEntrypoint extends WorkerEntrypoint<RunnerEnv> implements SandboxService {
   async exec(sandboxId: string, command: string): Promise<ExecResult> {
     const { stdout, stderr, exitCode } = await this.#sandbox(sandboxId).exec(command);
     return { stdout, stderr, exitCode };
@@ -37,7 +41,9 @@ export class SandboxEntrypoint extends WorkerEntrypoint<Env> implements SandboxS
   }
 
   #sandbox(sandboxId: string) {
-    return getSandbox(this.env.Sandbox, sandboxId);
+    // DurableObjectId.toString() は 64 文字だが、@cloudflare/sandbox は
+    // DNS ラベル長に合わせて 63 文字までしか受け付けない。
+    return getSandbox(this.env.Sandbox, sandboxId.slice(0, 63), { normalizeId: true });
   }
 }
 
@@ -46,4 +52,4 @@ export default {
   async fetch(): Promise<Response> {
     return new Response(null, { status: 404 });
   },
-} satisfies ExportedHandler<Env>;
+} satisfies ExportedHandler<RunnerEnv>;

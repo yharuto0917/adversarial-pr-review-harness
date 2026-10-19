@@ -8,10 +8,9 @@ export default defineConfig({
       main: "./test/worker.ts",
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
-        // 実 Worker (pr-review-runner) はローカルに存在しないため、
-        // service binding はテスト用のスタブで置き換える
+        // 実コンテナ (pr-review-runner) の代わりに、test/worker.ts の SandboxEntrypoint へ RPC で繋ぐ
         serviceBindings: {
-          RUNNER: () => new Response(null, { status: 501 }),
+          RUNNER: { name: "pr-review-gateway", entrypoint: "SandboxEntrypoint" },
         },
         bindings: { ADMIN_TOKEN: "test-admin-token", REVIEW_MODEL: "faux/faux-1" },
         // 差し替え前の ReviewOrchestrator。vault との配線を本物のまま確かめるために残す

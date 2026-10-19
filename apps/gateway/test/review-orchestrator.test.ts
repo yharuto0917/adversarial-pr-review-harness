@@ -4,7 +4,7 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import { VAULT_INSTANCE_NAME } from "@repo/orchestrator";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { executed, faux, type ProductionOrchestrator } from "./worker.js";
+import { executed, faux, type ProductionOrchestrator, sandboxFiles } from "./worker.js";
 
 const toolCall = (name: string, args: Parameters<typeof fauxToolCall>[1]) =>
   fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
@@ -19,6 +19,7 @@ const request = {
 describe("ReviewOrchestrator", () => {
   beforeEach(() => {
     executed.length = 0;
+    sandboxFiles.clear();
   });
 
   it("レビューを実行し、報告された指摘を実行単位で保持する", async () => {
@@ -67,6 +68,43 @@ describe("ReviewOrchestrator", () => {
     expect(first.accepted).toBe(true);
     expect(second.accepted).toBe(false);
     expect(faux.state.callCount - callsBefore).toBe(1);
+  });
+
+  it("ports().sandbox を差し替えず RUNNER RPC 経由で 4 つのツールすべてがサンドボックスに届き結果が返る", async () => {
+    const toolResults: Array<{ toolName: string; isError: boolean; text: string }> = [];
+    faux.setResponses([
+      toolCall("write_file", { path: "repro.txt", content: "from-orchestrator" }),
+      toolCall("read_file", { path: "repro.txt" }),
+      toolCall("list_files", { path: "." }),
+      toolCall("exec", { command: "cat repro.txt" }),
+      (context) => {
+        for (const msg of context.messages) {
+          if (msg.role === "toolResult") {
+            const text = msg.content
+              .flatMap((part) => (part.type === "text" ? [part.text] : []))
+              .join("");
+            toolResults.push({ toolName: msg.toolName, isError: msg.isError, text });
+          }
+        }
+        return fauxAssistantMessage(fauxText("4 操作とも到達"));
+      },
+    ]);
+    const orchestrator = env.ORCHESTRATOR.getByName("octo/repo#4");
+
+    await orchestrator.start(request);
+    const result = await orchestrator.result(request.deliveryId);
+
+    expect(result).toMatchObject({ status: "done", text: "4 操作とも到達" });
+    expect(toolResults).toEqual([
+      { toolName: "write_file", isError: false, text: "wrote repro.txt" },
+      { toolName: "read_file", isError: false, text: "from-orchestrator" },
+      { toolName: "list_files", isError: false, text: "repro.txt" },
+      { toolName: "exec", isError: false, text: "exit code: 0\n--- stdout ---\nfrom-orchestrator" },
+    ]);
+    const [sandboxId] = [...sandboxFiles.keys()];
+    expect(sandboxId).toMatch(/^[0-9a-f]{64}$/);
+    expect(sandboxFiles.get(sandboxId ?? "")?.get("repro.txt")).toBe("from-orchestrator");
+    expect(executed).toEqual(["cat repro.txt"]);
   });
 });
 
