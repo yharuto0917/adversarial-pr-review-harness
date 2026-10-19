@@ -1,4 +1,4 @@
-import { createReviewModels, parseModelRef } from "@repo/harness";
+import { bindSandbox, createReviewModels, parseModelRef } from "@repo/harness";
 import { DEFAULT_REVIEW_MODEL, VAULT_INSTANCE_NAME, vaultCredentials } from "@repo/orchestrator";
 import { Hono } from "hono";
 
@@ -94,6 +94,31 @@ adminRoutes.post("/credentials/:providerId/verify", async (c) => {
   } catch (error) {
     // 更新の失敗（リフレッシュトークンの失効など）はここに来る
     return c.json({ ok: false, model: `${ref.provider}/${ref.id}`, error: describe(error) }, 502);
+  }
+});
+
+/**
+ * RUNNER binding (SandboxEntrypoint) 経由で writeFile / readFile / listFiles / exec の
+ * 4 操作を順に呼び、すべてサンドボックスまで届いて結果が返るかを確かめる。
+ */
+adminRoutes.post("/sandbox/verify", async (c) => {
+  const sandboxId = c.req.query("sandboxId") ?? "verify";
+  const sandbox = bindSandbox(c.env.RUNNER, sandboxId);
+  const fileName = "verify.txt";
+  const content = `verified-${Date.now()}`;
+  try {
+    await sandbox.writeFile(fileName, content);
+    const read = await sandbox.readFile(fileName);
+    const files = await sandbox.listFiles(".");
+    const exec = await sandbox.exec(`cat ${fileName}`);
+    const ok =
+      read === content &&
+      files.includes(fileName) &&
+      exec.exitCode === 0 &&
+      exec.stdout.trim() === content;
+    return c.json({ ok, sandboxId, read, files, exec }, ok ? 200 : 502);
+  } catch (error) {
+    return c.json({ ok: false, sandboxId, error: describe(error) }, 502);
   }
 });
 
