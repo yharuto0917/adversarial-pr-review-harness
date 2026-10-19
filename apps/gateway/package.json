@@ -12,16 +12,16 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@earendil-works/pi-ai": "catalog:",
     "@repo/github": "workspace:*",
+    "@repo/harness": "workspace:*",
     "@repo/orchestrator": "workspace:*",
     "@repo/review-core": "workspace:*",
     "hono": "catalog:"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "catalog:",
-    "@earendil-works/pi-ai": "catalog:",
     "@repo/config": "workspace:*",
-    "@repo/harness": "workspace:*",
     "@types/node": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:",
