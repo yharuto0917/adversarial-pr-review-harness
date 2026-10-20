@@ -44,12 +44,21 @@ describe("vaultCredentials", () => {
     const vault = fakeVault(["unused"]);
     const models = createReviewModels({
       credentials: vaultCredentials(vault),
-      env: (name) => (name === "ANTHROPIC_API_KEY" ? "anthropic-key" : undefined),
+      env: (name) => {
+        if (name === "ANTHROPIC_API_KEY") return "anthropic-key";
+        if (name === "OPENCODE_API_KEY") return "opencode-key";
+        if (name === "OPENROUTER_API_KEY") return "openrouter-key";
+        return undefined;
+      },
     });
 
-    const auth = await models.getAuth("anthropic");
+    const anthropicAuth = await models.getAuth("anthropic");
+    const opencodeAuth = await models.getAuth("opencode");
+    const openrouterAuth = await models.getAuth("openrouter");
 
-    expect(auth?.auth.apiKey).toBe("anthropic-key");
+    expect(anthropicAuth?.auth.apiKey).toBe("anthropic-key");
+    expect(opencodeAuth?.auth.apiKey).toBe("opencode-key");
+    expect(openrouterAuth?.auth.apiKey).toBe("openrouter-key");
     expect(vault.asked).toEqual([]);
   });
 

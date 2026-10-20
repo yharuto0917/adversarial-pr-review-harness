@@ -22,6 +22,32 @@ describe("createReviewModels", () => {
     await expect(models.getAuth("anthropic")).resolves.toBeUndefined();
   });
 
+  it("OpenCode と OpenRouter の認証情報とモデルを解決できる", async () => {
+    const models = createReviewModels({
+      credentials: emptyStore,
+      env: (name) => {
+        if (name === "OPENCODE_API_KEY") return "opencode-key";
+        if (name === "OPENROUTER_API_KEY") return "openrouter-key";
+        return undefined;
+      },
+    });
+
+    await expect(models.getAuth("opencode")).resolves.toMatchObject({
+      auth: { apiKey: "opencode-key" },
+    });
+    await expect(models.getAuth("openrouter")).resolves.toMatchObject({
+      auth: { apiKey: "openrouter-key" },
+    });
+    expect(models.getModel("opencode", "gpt-6-sol")).toMatchObject({
+      provider: "opencode",
+      id: "gpt-6-sol",
+    });
+    expect(models.getModel("openrouter", "anthropic/claude-sonnet-4.5")).toMatchObject({
+      provider: "openrouter",
+      id: "anthropic/claude-sonnet-4.5",
+    });
+  });
+
   it("保存済みの認証情報は env より優先される", async () => {
     const models = createReviewModels({
       credentials: {
