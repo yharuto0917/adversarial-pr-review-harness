@@ -38,7 +38,7 @@
   ],
   // OpenAI は Sign in with ChatGPT の認証情報を /admin から登録するため、ここには無い。
   // それ以外のプロバイダを REVIEW_MODEL で選ぶ場合は、対応する API キーを追加で設定する
-  // (GEMINI_API_KEY / ANTHROPIC_API_KEY)。
+  // (GEMINI_API_KEY / ANTHROPIC_API_KEY / OPENCODE_API_KEY / OPENROUTER_API_KEY)。
   "secrets": {
     "required": ["ADMIN_TOKEN"]
   }

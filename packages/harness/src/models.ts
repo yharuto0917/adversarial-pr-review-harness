@@ -3,11 +3,13 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { googleProvider } from "@earendil-works/pi-ai/providers/google";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
+import { opencodeProvider } from "@earendil-works/pi-ai/providers/opencode";
+import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 
 export interface ReviewModelsOptions {
   /** 保存済みの認証情報。ここに無いプロバイダは `env` の API キーにフォールバックする。 */
   readonly credentials: CredentialStore;
-  /** API キーを引く環境変数（`GEMINI_API_KEY` / `ANTHROPIC_API_KEY` など）の参照先。 */
+  /** API キーを引く環境変数（`GEMINI_API_KEY` / `ANTHROPIC_API_KEY` / `OPENCODE_API_KEY` / `OPENROUTER_API_KEY` など）の参照先。 */
   readonly env: (name: string) => string | undefined;
 }
 
@@ -24,6 +26,8 @@ export function createReviewModels(options: ReviewModelsOptions): MutableModels 
   models.setProvider(openaiProvider());
   models.setProvider(googleProvider());
   models.setProvider(anthropicProvider());
+  models.setProvider(opencodeProvider());
+  models.setProvider(openrouterProvider());
   return models;
 }
 

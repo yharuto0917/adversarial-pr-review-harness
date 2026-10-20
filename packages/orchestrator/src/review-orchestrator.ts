@@ -27,6 +27,8 @@ export interface OrchestratorEnv {
   readonly REVIEW_MODEL?: string;
   readonly GEMINI_API_KEY?: string;
   readonly ANTHROPIC_API_KEY?: string;
+  readonly OPENCODE_API_KEY?: string;
+  readonly OPENROUTER_API_KEY?: string;
 }
 
 export interface ReviewRequest {
