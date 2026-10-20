@@ -21,3 +21,9 @@ coverage/
 # editor / OS
 .DS_Store
 *.log
+
+# Auth
+auth.json
+
+# Worktrees
+.worktrees/

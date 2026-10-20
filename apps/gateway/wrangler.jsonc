@@ -11,6 +11,10 @@
       {
         "name": "ORCHESTRATOR",
         "class_name": "ReviewOrchestrator"
+      },
+      {
+        "name": "VAULT",
+        "class_name": "CredentialVault"
       }
     ]
   },
@@ -18,12 +22,24 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["ReviewOrchestrator"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["CredentialVault"]
     }
   ],
   "services": [
     {
       "binding": "RUNNER",
-      "service": "pr-review-runner"
+      "service": "pr-review-runner",
+      // サンドボックス操作は HTTP ではなく RPC で呼ぶ
+      "entrypoint": "SandboxEntrypoint"
     }
-  ]
+  ],
+  // OpenAI は Sign in with ChatGPT の認証情報を /admin から登録するため、ここには無い。
+  // それ以外のプロバイダを REVIEW_MODEL で選ぶ場合は、対応する API キーを追加で設定する
+  // (GEMINI_API_KEY / ANTHROPIC_API_KEY)。
+  "secrets": {
+    "required": ["ADMIN_TOKEN"]
+  }
 }

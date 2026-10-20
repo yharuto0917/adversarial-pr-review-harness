@@ -14,8 +14,11 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@earendil-works/pi-ai": "catalog:",
+    "@earendil-works/pi-durable": "catalog:",
     "@repo/harness": "workspace:*",
-    "@repo/review-core": "workspace:*"
+    "@repo/review-core": "workspace:*",
+    "agents": "catalog:"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "catalog:",

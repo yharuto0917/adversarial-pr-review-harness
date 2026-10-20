@@ -5,14 +5,16 @@
   "type": "module",
   "scripts": {
     "build": "wrangler deploy --dry-run --outdir dist",
-    "dev": "wrangler dev",
+    "dev": "wrangler dev -c wrangler.jsonc -c ../runner/wrangler.jsonc",
     "deploy": "wrangler deploy",
-    "cf-typegen": "wrangler types",
-    "typecheck": "wrangler types && tsc -p tsconfig.json",
+    "cf-typegen": "wrangler types -c wrangler.jsonc -c ../runner/wrangler.jsonc",
+    "typecheck": "wrangler types -c wrangler.jsonc -c ../runner/wrangler.jsonc && tsc -p tsconfig.json",
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@earendil-works/pi-ai": "catalog:",
     "@repo/github": "workspace:*",
+    "@repo/harness": "workspace:*",
     "@repo/orchestrator": "workspace:*",
     "@repo/review-core": "workspace:*",
     "hono": "catalog:"
