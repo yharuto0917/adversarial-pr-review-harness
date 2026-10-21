@@ -16,6 +16,7 @@
   "dependencies": {
     "@earendil-works/pi-ai": "catalog:",
     "@earendil-works/pi-durable": "catalog:",
+    "@repo/github": "workspace:*",
     "@repo/harness": "workspace:*",
     "@repo/review-core": "workspace:*",
     "agents": "catalog:"

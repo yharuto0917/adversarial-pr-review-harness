@@ -1,6 +1,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import type { MutableModels } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { clearInstallationTokenCache } from "@repo/github";
 import { VAULT_INSTANCE_NAME } from "@repo/orchestrator";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -14,12 +15,32 @@ const request = {
   repository: "octo/repo",
   pullNumber: 1,
   headSha: "abc123",
+  installationId: 42,
 };
 
 describe("ReviewOrchestrator", () => {
   beforeEach(() => {
     executed.length = 0;
     sandboxFiles.clear();
+    clearInstallationTokenCache();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/app/installations/42/access_tokens")) {
+          const expiresAt = new Date(Date.now() + 3600_000).toISOString();
+          return Response.json({ token: "ghs_inst_42", expires_at: expiresAt }, { status: 201 });
+        }
+        if (url.endsWith("/repos/octo/repo/pulls/1")) {
+          return new Response("diff --git a/src/sum.ts b/src/sum.ts", { status: 200 });
+        }
+        return new Response("unexpected url", { status: 404 });
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("レビューを実行し、報告された指摘を実行単位で保持する", async () => {
@@ -105,6 +126,127 @@ describe("ReviewOrchestrator", () => {
     expect(sandboxId).toMatch(/^[0-9a-f]{64}$/);
     expect(sandboxFiles.get(sandboxId ?? "")?.get("repro.txt")).toBe("from-orchestrator");
     expect(executed).toEqual(["cat repro.txt"]);
+  });
+
+  it("ports().github を差し替えず get_diff / post_review / resolve_thread の 3 操作が installation token 経由で GitHub API に届く", async () => {
+    const githubCalls: Array<{
+      url: string;
+      method: string | undefined;
+      auth: string | undefined;
+      accept: string | undefined;
+      body: string | undefined;
+    }> = [];
+    const toolResults: Array<{ toolName: string; isError: boolean; text: string }> = [];
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        const headers = new Headers(init?.headers);
+        githubCalls.push({
+          url,
+          method: init?.method,
+          auth: headers.get("Authorization") ?? undefined,
+          accept: headers.get("Accept") ?? undefined,
+          body: typeof init?.body === "string" ? init.body : undefined,
+        });
+        if (url.endsWith("/app/installations/99/access_tokens")) {
+          const expiresAt = new Date(Date.now() + 3600_000).toISOString();
+          return Response.json(
+            { token: "ghs_secret_token_99", expires_at: expiresAt },
+            { status: 201 },
+          );
+        }
+        if (url.endsWith("/repos/octo/repo/pulls/5")) {
+          return new Response("diff --git a/index.ts b/index.ts\n+const x = 1;", { status: 200 });
+        }
+        if (url.endsWith("/repos/octo/repo/pulls/5/reviews")) {
+          return Response.json({ id: 501 }, { status: 200 });
+        }
+        if (url.endsWith("/graphql")) {
+          return Response.json({
+            data: { resolveReviewThread: { thread: { id: "PRRT_kwDO999", isResolved: true } } },
+          });
+        }
+        return new Response("not found", { status: 404 });
+      }),
+    );
+
+    faux.setResponses([
+      toolCall("get_diff", {}),
+      toolCall("resolve_thread", { threadId: "PRRT_kwDO999" }),
+      toolCall("post_review", { body: "すべて問題ありません。" }),
+      (context) => {
+        for (const msg of context.messages) {
+          if (msg.role === "toolResult") {
+            const text = msg.content
+              .flatMap((part) => (part.type === "text" ? [part.text] : []))
+              .join("");
+            toolResults.push({ toolName: msg.toolName, isError: msg.isError, text });
+          }
+        }
+        return fauxAssistantMessage(fauxText("GitHub 3 操作完了"));
+      },
+    ]);
+
+    const orchestrator = env.ORCHESTRATOR.getByName("octo/repo#5");
+    await orchestrator.start({
+      deliveryId: "delivery-github-5",
+      repository: "octo/repo",
+      pullNumber: 5,
+      headSha: "sha555",
+      installationId: 99,
+    });
+    const result = await orchestrator.result("delivery-github-5");
+
+    expect(result).toMatchObject({ status: "done", text: "GitHub 3 操作完了" });
+    expect(toolResults).toEqual([
+      {
+        toolName: "get_diff",
+        isError: false,
+        text: "diff --git a/index.ts b/index.ts\n+const x = 1;",
+      },
+      { toolName: "resolve_thread", isError: false, text: "resolved PRRT_kwDO999" },
+      { toolName: "post_review", isError: false, text: "posted" },
+    ]);
+    // ツール結果にトークンが含まれないことを確認
+    for (const r of toolResults) {
+      expect(r.text).not.toContain("ghs_secret_token_99");
+    }
+
+    // 1 回目の installation token 発行 + 3 つの GitHub API 呼び出し（キャッシュ再利用で計 4 回）
+    expect(githubCalls).toHaveLength(4);
+    expect(githubCalls[0]?.url).toBe("https://api.github.com/app/installations/99/access_tokens");
+    expect(githubCalls[0]?.method).toBe("POST");
+    expect(githubCalls[0]?.auth).toMatch(/^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+
+    expect(githubCalls.slice(1)).toEqual([
+      {
+        url: "https://api.github.com/repos/octo/repo/pulls/5",
+        method: "GET",
+        auth: "Bearer ghs_secret_token_99",
+        accept: "application/vnd.github.v3.diff",
+        body: undefined,
+      },
+      {
+        url: "https://api.github.com/graphql",
+        method: "POST",
+        auth: "Bearer ghs_secret_token_99",
+        accept: "application/vnd.github+json",
+        body: JSON.stringify({
+          query:
+            "mutation($threadId: ID!) { resolveReviewThread(input: { threadId: $threadId }) { thread { id isResolved } } }",
+          variables: { threadId: "PRRT_kwDO999" },
+        }),
+      },
+      {
+        url: "https://api.github.com/repos/octo/repo/pulls/5/reviews",
+        method: "POST",
+        auth: "Bearer ghs_secret_token_99",
+        accept: "application/vnd.github+json",
+        body: JSON.stringify({ body: "すべて問題ありません。", event: "COMMENT" }),
+      },
+    ]);
   });
 });
 
