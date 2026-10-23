@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { MutableModels } from "@earendil-works/pi-ai";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
+import { createPullRequestClient, issueInstallationToken } from "@repo/github";
 import {
   bindSandbox,
   createReviewExtension,
@@ -23,6 +24,8 @@ export const DEFAULT_REVIEW_MODEL = "openai/gpt-6-sol";
 export interface OrchestratorEnv {
   readonly VAULT: DurableObjectNamespace<CredentialVault>;
   readonly RUNNER: SandboxService;
+  readonly GITHUB_APP_ID: string;
+  readonly GITHUB_APP_PRIVATE_KEY: string;
   /** `<provider>/<model id>` 形式。 */
   readonly REVIEW_MODEL?: string;
   readonly GEMINI_API_KEY?: string;
@@ -38,6 +41,15 @@ export interface ReviewRequest {
   readonly repository: string;
   readonly pullNumber: number;
   readonly headSha: string;
+  /** GitHub App の installation id。 */
+  readonly installationId?: number;
+}
+
+interface ReviewTarget {
+  readonly repository: string;
+  readonly pullNumber: number;
+  readonly headSha: string;
+  readonly installationId: number;
 }
 
 /**
@@ -65,8 +77,20 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
 
   readonly lifecycle = Lifecycle.install(this).use(this.harness);
 
+  constructor(ctx: DurableObjectState, env: OrchestratorEnv) {
+    super(ctx, env);
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS review_target (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      repository TEXT NOT NULL,
+      pull_number INTEGER NOT NULL,
+      head_sha TEXT NOT NULL,
+      installation_id INTEGER NOT NULL
+    )`);
+  }
+
   /** レビューを開始する。モデルが動く前に、入力を永続化した時点で返る。 */
   async start(request: ReviewRequest): Promise<PiReceipt> {
+    this.#saveTarget(request);
     // TODO: サンドボックスに PR の head をチェックアウトする（installation token が要る）
     return this.harness.submit(
       `${request.repository} の Pull Request #${request.pullNumber}（head: ${request.headSha}）をレビューしてください。`,
@@ -97,12 +121,70 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
   protected ports(): HarnessPorts {
     return {
       sandbox: bindSandbox(this.env.RUNNER, this.ctx.id.toString()),
-      github: unimplementedGitHub,
+      github: this.#createGitHubPort(),
       findings: {
         report: async (finding) => {
           this.#findings.record(await this.#runningOperation(), finding);
         },
       },
+    };
+  }
+
+  /**
+   * PR ごとの DO が都度 installation token を発行して GitHub API を呼ぶ。
+   * トークンは DO 内部に閉じ込め、ツール側には渡さない。
+   */
+  #createGitHubPort(): GitHubPort {
+    const client = () => {
+      const target = this.#requireTarget();
+      return createPullRequestClient({
+        repository: target.repository,
+        pullNumber: target.pullNumber,
+        getToken: () =>
+          issueInstallationToken({
+            appId: this.env.GITHUB_APP_ID,
+            privateKey: this.env.GITHUB_APP_PRIVATE_KEY,
+            installationId: target.installationId,
+          }),
+      });
+    };
+    return {
+      getDiff: () => client().getDiff(),
+      postReview: (body) => client().postReview(body),
+      resolveThread: (threadId) => client().resolveThread(threadId),
+    };
+  }
+
+  #saveTarget(request: ReviewRequest): void {
+    this.ctx.storage.sql.exec(
+      `INSERT OR REPLACE INTO review_target (id, repository, pull_number, head_sha, installation_id)
+       VALUES (1, ?, ?, ?, ?)`,
+      request.repository,
+      request.pullNumber,
+      request.headSha,
+      request.installationId ?? 0,
+    );
+  }
+
+  #requireTarget(): ReviewTarget {
+    const row = this.ctx.storage.sql
+      .exec<{
+        repository: string;
+        pull_number: number;
+        head_sha: string;
+        installation_id: number;
+      }>(
+        "SELECT repository, pull_number, head_sha, installation_id FROM review_target WHERE id = 1",
+      )
+      .toArray()[0];
+    if (!row) {
+      throw new Error("review target is not initialized; call start() first");
+    }
+    return {
+      repository: row.repository,
+      pullNumber: row.pull_number,
+      headSha: row.head_sha,
+      installationId: row.installation_id,
     };
   }
 
@@ -115,10 +197,3 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
     return running.operationId;
   }
 }
-
-/** TODO: @repo/github の実装後に、installation token を使う実体へ置き換える。 */
-const unimplementedGitHub: GitHubPort = {
-  getDiff: () => Promise.reject(new Error("not implemented: GitHubPort.getDiff")),
-  postReview: () => Promise.reject(new Error("not implemented: GitHubPort.postReview")),
-  resolveThread: () => Promise.reject(new Error("not implemented: GitHubPort.resolveThread")),
-};

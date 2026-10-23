@@ -271,6 +271,9 @@ importers:
       '@earendil-works/pi-durable':
         specifier: 'catalog:'
         version: 1.2.0(@aws-sdk/credential-provider-node@3.972.82)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.5.4))(@smithy/hash-node@4.5.2)(@smithy/signature-v4@5.7.4)(supports-color@10.2.2)(undici@7.29.0)(ws@8.21.0)(zod@4.5.4)
+      '@repo/github':
+        specifier: workspace:*
+        version: link:../github
       '@repo/harness':
         specifier: workspace:*
         version: link:../harness
