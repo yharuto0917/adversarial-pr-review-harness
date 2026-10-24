@@ -32,7 +32,7 @@ function createFakeSandbox(
 }
 
 describe("detectNodeProject", () => {
-  it("packageManager フィールドが指定されていれば最優先で使い、lockfile の有無に応じてインストールコマンドを決める", () => {
+  it("packageManager フィールドが指定されていれば指定バージョンを corepack 経由で起動し、lockfile の有無に応じてインストールコマンドを決める", () => {
     const pkg = JSON.stringify({
       name: "sample",
       packageManager: "pnpm@11.25.0",
@@ -46,15 +46,51 @@ describe("detectNodeProject", () => {
 
     expect(detectNodeProject(pkg, ["package.json", "pnpm-lock.yaml"])).toEqual({
       packageManager: "pnpm",
-      installCommand: "pnpm install --frozen-lockfile",
-      testCommands: ["pnpm test", "pnpm run test:unit", "pnpm run typecheck"],
+      installCommand: "corepack pnpm@11.25.0 install --frozen-lockfile",
+      testCommands: [
+        "corepack pnpm@11.25.0 test",
+        "corepack pnpm@11.25.0 run test:unit",
+        "corepack pnpm@11.25.0 run typecheck",
+      ],
     });
 
     expect(detectNodeProject(pkg, ["package.json"])).toEqual({
       packageManager: "pnpm",
-      installCommand: "pnpm install",
-      testCommands: ["pnpm test", "pnpm run test:unit", "pnpm run typecheck"],
+      installCommand: "corepack pnpm@11.25.0 install",
+      testCommands: [
+        "corepack pnpm@11.25.0 test",
+        "corepack pnpm@11.25.0 run test:unit",
+        "corepack pnpm@11.25.0 run typecheck",
+      ],
     });
+  });
+
+  it("Yarn 4 やハッシュ付きの packageManager 指定でもバージョンを保持して起動コマンドを組み立てる", () => {
+    const pkg = JSON.stringify({
+      name: "yarn4-sample",
+      packageManager: "yarn@4.5.0+sha512.837566d24eec14ec0f5f1411adb544e892b3454255e61fdef8fd",
+      scripts: {
+        test: "jest",
+        "test:integration": "jest --selectProjects integration",
+      },
+    });
+
+    expect(detectNodeProject(pkg, ["package.json", "yarn.lock"])).toEqual({
+      packageManager: "yarn",
+      installCommand: "corepack yarn@4.5.0 install --frozen-lockfile",
+      testCommands: ["corepack yarn@4.5.0 test", "corepack yarn@4.5.0 run test:integration"],
+    });
+  });
+
+  it("packageManager フィールドに不正なバージョン文字列が含まれる場合はエラーを投げる", () => {
+    const pkg = JSON.stringify({
+      name: "bad",
+      packageManager: "yarn@4.5.0; rm -rf /",
+    });
+
+    expect(() => detectNodeProject(pkg, ["package.json"])).toThrow(
+      /invalid packageManager version in package\.json/,
+    );
   });
 
   it("packageManager フィールドが無い場合は lockfile から pnpm / yarn / npm を判定する", () => {
@@ -168,7 +204,7 @@ describe("setupNodeProject", () => {
     );
 
     await expect(setupNodeProject(sandbox)).rejects.toThrow(
-      'failed to install dependencies with "pnpm install --frozen-lockfile" (exit 1): ERR_PNPM_FETCH_404',
+      'failed to install dependencies with "corepack pnpm@11.25.0 install --frozen-lockfile" (exit 1): ERR_PNPM_FETCH_404',
     );
   });
 });

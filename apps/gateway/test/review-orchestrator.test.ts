@@ -281,7 +281,7 @@ describe("ReviewOrchestrator", () => {
 
   it.each([
     {
-      label: "pnpm",
+      label: "pnpm (packageManager 指定)",
       pullNumber: 901,
       sha: "sha-pnpm",
       files: {
@@ -292,12 +292,13 @@ describe("ReviewOrchestrator", () => {
         }),
         "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
       },
-      expectedInstall: "pnpm install --frozen-lockfile",
-      expectedHint: "テストコマンドの候補: pnpm test, pnpm run typecheck",
-      testCmd: "pnpm test",
+      expectedInstall: "corepack pnpm@11.25.0 install --frozen-lockfile",
+      expectedHint:
+        "テストコマンドの候補: corepack pnpm@11.25.0 test, corepack pnpm@11.25.0 run typecheck",
+      testCmd: "corepack pnpm@11.25.0 test",
     },
     {
-      label: "yarn",
+      label: "yarn (lockfile のみ)",
       pullNumber: 902,
       sha: "sha-yarn",
       files: {
@@ -310,6 +311,22 @@ describe("ReviewOrchestrator", () => {
       expectedInstall: "yarn install --frozen-lockfile",
       expectedHint: "テストコマンドの候補: yarn test",
       testCmd: "yarn test",
+    },
+    {
+      label: "yarn v4 (packageManager 指定)",
+      pullNumber: 904,
+      sha: "sha-yarn4",
+      files: {
+        "package.json": JSON.stringify({
+          name: "yarn4-app",
+          packageManager: "yarn@4.5.0",
+          scripts: { test: "vitest run" },
+        }),
+        "yarn.lock": "__metadata:\n  version: 8\n",
+      },
+      expectedInstall: "corepack yarn@4.5.0 install --frozen-lockfile",
+      expectedHint: "テストコマンドの候補: corepack yarn@4.5.0 test",
+      testCmd: "corepack yarn@4.5.0 test",
     },
     {
       label: "npm",
@@ -440,6 +457,110 @@ describe("ReviewOrchestrator", () => {
     const result = await stub.result("del-ok-2");
     expect(result).toMatchObject({ status: "done", text: "ok-2" });
     expect(executed).toHaveLength(6);
+  });
+
+  it("依存インストール中に同じ head への start() が重なった場合、実行中の Promise を共有して node_modules を壊さない", async () => {
+    remoteRepoFiles.set("octo/repo@sha-concurrent", {
+      "package.json": JSON.stringify({ name: "concurrent-app", scripts: { test: "vitest run" } }),
+      "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    });
+
+    faux.setResponses([
+      toolCall("exec", { command: "pnpm test" }),
+      fauxAssistantMessage(fauxText("1回目完了")),
+      fauxAssistantMessage(fauxText("2回目完了")),
+    ]);
+
+    const orchestrator = env.ORCHESTRATOR.getByName("octo/repo#920");
+
+    // 同じ head に対して 2 つの start() を同時に呼び出す
+    const [r1, r2] = await Promise.all([
+      orchestrator.start({
+        ...request,
+        deliveryId: "del-conc-1",
+        pullNumber: 920,
+        headSha: "sha-concurrent",
+      }),
+      orchestrator.start({
+        ...request,
+        deliveryId: "del-conc-2",
+        pullNumber: 920,
+        headSha: "sha-concurrent",
+      }),
+    ]);
+
+    if (r1.accepted) {
+      await orchestrator.result("del-conc-1");
+    }
+    if (r2.accepted) {
+      await orchestrator.result("del-conc-2");
+    }
+
+    // チェックアウトと依存インストールは 1 回ずつしか走らず、node_modules も保持されている
+    const checkoutCalls = executed.filter((cmd) => cmd.includes("git init -q"));
+    const installCalls = executed.filter((cmd) => cmd === "pnpm install --frozen-lockfile");
+    expect(checkoutCalls).toHaveLength(1);
+    expect(installCalls).toHaveLength(1);
+    const [sandboxId] = [...sandboxFiles.keys()];
+    expect(sandboxFiles.get(sandboxId ?? "")?.has("node_modules/.installed")).toBe(true);
+  });
+
+  it("旧スキーマ（test_commands_json 列なし）から移行した際は既存の checked_out_sha キャッシュを無効化し、同じ head でも依存インストールとコマンド検出を実行する", async () => {
+    remoteRepoFiles.set("octo/repo@sha-legacy", {
+      "package.json": JSON.stringify({
+        name: "legacy-app",
+        scripts: { test: "vitest run" },
+      }),
+      "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    });
+
+    const stub = env.ORCHESTRATOR.getByName("octo/repo#930");
+
+    // 旧スキーマの状態（test_commands_json 列がなく、checked_out_sha が既に保存されている状態）を再現
+    await runInDurableObject(stub, async (instance) => {
+      const sql = (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql;
+      sql.exec("DROP TABLE review_target");
+      sql.exec(`CREATE TABLE review_target (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        repository TEXT NOT NULL,
+        pull_number INTEGER NOT NULL,
+        head_sha TEXT NOT NULL,
+        installation_id INTEGER NOT NULL,
+        checked_out_sha TEXT
+      )`);
+      sql.exec(
+        "INSERT INTO review_target (id, repository, pull_number, head_sha, installation_id, checked_out_sha) VALUES (1, 'octo/repo', 930, 'sha-legacy', 42, 'sha-legacy')",
+      );
+    });
+
+    const userPrompts: string[] = [];
+    faux.setResponses([
+      (context) => {
+        const lastUser = [...context.messages].reverse().find((m) => m.role === "user");
+        const promptText =
+          typeof lastUser?.content === "string"
+            ? lastUser.content
+            : (lastUser?.content.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("") ??
+              "");
+        userPrompts.push(promptText);
+        return fauxAssistantMessage(fauxText("移行後レビュー完了"));
+      },
+    ]);
+
+    await stub.start({
+      ...request,
+      deliveryId: "del-legacy-1",
+      pullNumber: 930,
+      headSha: "sha-legacy",
+    });
+    const result = await stub.result("del-legacy-1");
+
+    expect(result).toMatchObject({ status: "done", text: "移行後レビュー完了" });
+    expect(executed).toEqual([
+      expect.stringContaining("https://github.com/octo/repo.git -- sha-legacy"),
+      "pnpm install --frozen-lockfile",
+    ]);
+    expect(userPrompts[0]).toContain("テストコマンドの候補: pnpm test");
   });
 
   it("ports().github を差し替えず get_diff / post_review / resolve_thread の 3 操作が installation token 経由で GitHub API に届く", async () => {

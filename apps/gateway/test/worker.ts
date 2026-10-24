@@ -32,9 +32,10 @@ const GIT_FETCH_PATTERN =
   /git\s+-c\s+"http\.extraHeader=Authorization:\s+Basic\s+([^"]+)"\s+fetch\s+--depth\s+1\s+https:\/\/github\.com\/([^\s]+?)\.git\s+(?:--\s+)?([^\s&]+)/;
 
 const INSTALL_COMMAND_PATTERN =
-  /^(?:npm (?:ci|install)|pnpm install(?: --frozen-lockfile)?|yarn install(?: --frozen-lockfile)?)$/;
+  /^(?:corepack\s+(?:npm|pnpm|yarn)@[0-9A-Za-z.-]+\s+|(?:npm|pnpm|yarn)\s+)(?:ci|install(?: --frozen-lockfile)?)$/;
 
-const TEST_COMMAND_PATTERN = /^(?:npm|pnpm|yarn)\s+(?:test|run\s+\S+)$/;
+const TEST_COMMAND_PATTERN =
+  /^(?:corepack\s+(?:npm|pnpm|yarn)@[0-9A-Za-z.-]+\s+|(?:npm|pnpm|yarn)\s+)(?:test|run\s+\S+)$/;
 
 /**
  * RUNNER service binding のテスト用 RPC 実装。

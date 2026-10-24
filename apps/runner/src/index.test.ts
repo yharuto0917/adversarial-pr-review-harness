@@ -90,8 +90,10 @@ describe("Dockerfile", () => {
     expect(dockerfile).toContain(`FROM docker.io/cloudflare/sandbox:${sandboxPkg.version}`);
   });
 
-  it("npm に加えて pnpm と yarn をグローバルインストールする", () => {
+  it("npm に加えて corepack / pnpm / yarn をグローバルインストールする", () => {
+    expect(dockerfile).toContain("ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0");
     expect(dockerfile).toContain(rootPkg.packageManager);
+    expect(dockerfile).toMatch(/RUN\s+npm\s+install\s+-g\b.*\bcorepack@[\d.]+/);
     expect(dockerfile).toMatch(/RUN\s+npm\s+install\s+-g\b.*\bpnpm@[\d.]+/);
     expect(dockerfile).toMatch(/RUN\s+npm\s+install\s+-g\b.*\byarn@[\d.]+/);
   });

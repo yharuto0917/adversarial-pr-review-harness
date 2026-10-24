@@ -55,6 +55,11 @@ interface ReviewTarget {
   readonly testCommands: readonly string[];
 }
 
+interface InflightSetup {
+  readonly key: string;
+  readonly promise: Promise<readonly string[]>;
+}
+
 const SAFE_REPOSITORY = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
@@ -68,6 +73,7 @@ const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
   readonly #findings = new SqlFindingsStore(this.ctx.storage.sql);
   readonly #registry = createRegistry();
+  #inflightSetup: InflightSetup | null = null;
 
   readonly harness = new PiHarness({
     harness: ({ storage, context }) => {
@@ -85,23 +91,7 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
 
   constructor(ctx: DurableObjectState, env: OrchestratorEnv) {
     super(ctx, env);
-    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS review_target (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      repository TEXT NOT NULL,
-      pull_number INTEGER NOT NULL,
-      head_sha TEXT NOT NULL,
-      installation_id INTEGER NOT NULL,
-      checked_out_sha TEXT,
-      test_commands_json TEXT NOT NULL DEFAULT '[]'
-    )`);
-    const columns = this.ctx.storage.sql
-      .exec<{ name: string }>("PRAGMA table_info(review_target)")
-      .toArray();
-    if (!columns.some((col) => col.name === "test_commands_json")) {
-      this.ctx.storage.sql.exec(
-        "ALTER TABLE review_target ADD COLUMN test_commands_json TEXT NOT NULL DEFAULT '[]'",
-      );
-    }
+    this.#ensureSchema();
   }
 
   /** レビューを開始する。モデルが動く前に、入力を永続化した時点で返る。 */
@@ -112,8 +102,7 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
     if (!SAFE_REF.test(request.headSha) || request.headSha.includes("..")) {
       throw new Error(`invalid headSha: ${request.headSha}`);
     }
-    this.#saveTarget(request);
-    const testCommands = await this.#checkoutHead();
+    const testCommands = await this.#prepareTarget(request);
     return this.harness.submit(buildReviewPrompt(request, testCommands), {
       operationId: request.deliveryId,
     });
@@ -171,6 +160,65 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
     };
   }
 
+  #ensureSchema(): void {
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS review_target (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      repository TEXT NOT NULL,
+      pull_number INTEGER NOT NULL,
+      head_sha TEXT NOT NULL,
+      installation_id INTEGER NOT NULL,
+      checked_out_sha TEXT,
+      test_commands_json TEXT NOT NULL DEFAULT '[]'
+    )`);
+    const columns = this.ctx.storage.sql
+      .exec<{ name: string }>("PRAGMA table_info(review_target)")
+      .toArray();
+    if (!columns.some((col) => col.name === "test_commands_json")) {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE review_target ADD COLUMN test_commands_json TEXT NOT NULL DEFAULT '[]'",
+      );
+      this.ctx.storage.sql.exec("UPDATE review_target SET checked_out_sha = NULL WHERE id = 1");
+    }
+  }
+
+  /**
+   * サンドボックスのセットアップ（チェックアウトと依存インストール）を直列化する。
+   * 同じ head のセットアップが進行中であれば、後続の git clean -fdx で node_modules を壊さないよう
+   * 実行中の Promise を共有して待つ。
+   */
+  #prepareTarget(request: ReviewRequest): Promise<readonly string[]> {
+    const key = `${request.repository}#${request.pullNumber}@${request.headSha}`;
+    if (this.#inflightSetup?.key === key) {
+      if (request.installationId !== undefined && request.installationId !== 0) {
+        this.#saveTarget(request);
+      }
+      return this.#inflightSetup.promise;
+    }
+
+    const previous = this.#inflightSetup?.promise ?? Promise.resolve();
+    const run = async (): Promise<readonly string[]> => {
+      try {
+        await previous;
+      } catch {
+        // 先行する別 head のセットアップ失敗はそちらの呼び出し元に返っているため、後続のセットアップは続行する
+      }
+      this.#ensureSchema();
+      this.#saveTarget(request);
+      return this.#checkoutHead();
+    };
+
+    const promise = run();
+    const current: InflightSetup = { key, promise };
+    this.#inflightSetup = current;
+    const clearInflight = () => {
+      if (this.#inflightSetup === current) {
+        this.#inflightSetup = null;
+      }
+    };
+    promise.then(clearInflight, clearInflight);
+    return promise;
+  }
+
   /**
    * PR の head をサンドボックスのカレントディレクトリへチェックアウトし、
    * Node プロジェクトであればパッケージマネージャを検出して依存をインストールする。
@@ -178,6 +226,7 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
    * installation token は一時 HTTP ヘッダとして渡し、環境変数や `.git/config` 等には残さない。
    */
   async #checkoutHead(): Promise<readonly string[]> {
+    this.#ensureSchema();
     const target = this.#requireTarget();
     if (target.checkedOutSha === target.headSha) {
       return target.testCommands;

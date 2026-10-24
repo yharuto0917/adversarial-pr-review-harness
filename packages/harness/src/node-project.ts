@@ -20,6 +20,7 @@ export type NodeProjectSetupResult =
 const AUXILIARY_CHECK_SCRIPTS = ["typecheck", "type-check", "check", "check:ci", "lint"] as const;
 const DEFAULT_NPM_INIT_TEST_MARKER = "no test specified";
 const SAFE_SCRIPT_NAME = /^[A-Za-z0-9_.:-]+$/;
+const SAFE_VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/;
 
 /**
  * `package.json` の内容とルートファイル一覧から、
@@ -31,9 +32,9 @@ export function detectNodeProject(
 ): NodeProjectInfo {
   const pkg = parsePackageJson(packageJsonContent);
   const fileSet = new Set(rootFiles.map(normalizeRootFileName));
-  const packageManager = resolvePackageManager(pkg.packageManager, fileSet);
-  const installCommand = resolveInstallCommand(packageManager, fileSet);
-  const testCommands = extractTestCommands(packageManager, pkg.scripts);
+  const { packageManager, runner } = resolvePackageManager(pkg.packageManager, fileSet);
+  const installCommand = resolveInstallCommand(packageManager, runner, fileSet);
+  const testCommands = extractTestCommands(runner, pkg.scripts);
 
   return {
     packageManager,
@@ -115,48 +116,70 @@ function normalizeRootFileName(file: string): string {
   return file.replace(/^\.\//, "");
 }
 
+interface ResolvedPackageManager {
+  readonly packageManager: PackageManager;
+  readonly runner: string;
+}
+
 function resolvePackageManager(
   packageManagerField: string | undefined,
   fileSet: ReadonlySet<string>,
-): PackageManager {
+): ResolvedPackageManager {
   if (packageManagerField) {
-    const name = packageManagerField.split("@")[0]?.trim();
+    const trimmed = packageManagerField.trim();
+    const atIndex = trimmed.indexOf("@");
+    const name = (atIndex === -1 ? trimmed : trimmed.slice(0, atIndex)).trim();
+    const rawVersion = atIndex === -1 ? "" : trimmed.slice(atIndex + 1).trim();
+    const version = rawVersion.split("+")[0]?.trim() ?? "";
+
     if (name === "pnpm" || name === "yarn" || name === "npm") {
-      return name;
+      if (rawVersion.length > 0) {
+        if (!SAFE_VERSION.test(version)) {
+          throw new Error(`invalid packageManager version in package.json: ${packageManagerField}`);
+        }
+        return {
+          packageManager: name,
+          runner: `corepack ${name}@${version}`,
+        };
+      }
+      return { packageManager: name, runner: name };
     }
   }
 
   if (fileSet.has("pnpm-lock.yaml")) {
-    return "pnpm";
+    return { packageManager: "pnpm", runner: "pnpm" };
   }
   if (fileSet.has("yarn.lock")) {
-    return "yarn";
+    return { packageManager: "yarn", runner: "yarn" };
   }
   if (fileSet.has("package-lock.json") || fileSet.has("npm-shrinkwrap.json")) {
-    return "npm";
+    return { packageManager: "npm", runner: "npm" };
   }
 
-  return "npm";
+  return { packageManager: "npm", runner: "npm" };
 }
 
 function resolveInstallCommand(
   packageManager: PackageManager,
+  runner: string,
   fileSet: ReadonlySet<string>,
 ): string {
   switch (packageManager) {
     case "pnpm":
-      return fileSet.has("pnpm-lock.yaml") ? "pnpm install --frozen-lockfile" : "pnpm install";
+      return fileSet.has("pnpm-lock.yaml")
+        ? `${runner} install --frozen-lockfile`
+        : `${runner} install`;
     case "yarn":
-      return fileSet.has("yarn.lock") ? "yarn install --frozen-lockfile" : "yarn install";
+      return fileSet.has("yarn.lock") ? `${runner} install --frozen-lockfile` : `${runner} install`;
     case "npm":
       return fileSet.has("package-lock.json") || fileSet.has("npm-shrinkwrap.json")
-        ? "npm ci"
-        : "npm install";
+        ? `${runner} ci`
+        : `${runner} install`;
   }
 }
 
 function extractTestCommands(
-  packageManager: PackageManager,
+  runner: string,
   scripts: Readonly<Record<string, string>> | undefined,
 ): string[] {
   if (!scripts) {
@@ -167,7 +190,7 @@ function extractTestCommands(
 
   const testBody = scripts.test;
   if (testBody && !testBody.toLowerCase().includes(DEFAULT_NPM_INIT_TEST_MARKER)) {
-    commands.push(formatScriptCommand(packageManager, "test"));
+    commands.push(formatScriptCommand(runner, "test"));
   }
 
   for (const name of Object.keys(scripts)) {
@@ -176,22 +199,22 @@ function extractTestCommands(
       SAFE_SCRIPT_NAME.test(name) &&
       !name.toLowerCase().includes("watch")
     ) {
-      commands.push(formatScriptCommand(packageManager, name));
+      commands.push(formatScriptCommand(runner, name));
     }
   }
 
   for (const aux of AUXILIARY_CHECK_SCRIPTS) {
     if (scripts[aux]) {
-      commands.push(formatScriptCommand(packageManager, aux));
+      commands.push(formatScriptCommand(runner, aux));
     }
   }
 
   return commands;
 }
 
-export function formatScriptCommand(packageManager: PackageManager, scriptName: string): string {
+export function formatScriptCommand(runner: string, scriptName: string): string {
   if (scriptName === "test") {
-    return `${packageManager} test`;
+    return `${runner} test`;
   }
-  return `${packageManager} run ${scriptName}`;
+  return `${runner} run ${scriptName}`;
 }
