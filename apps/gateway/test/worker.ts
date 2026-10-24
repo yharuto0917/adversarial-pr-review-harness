@@ -16,6 +16,9 @@ export const executed: string[] = [];
 /** sandboxId ごとのインメモリファイルシステム。 */
 export const sandboxFiles = new Map<string, Map<string, string>>();
 
+/** `<repository>@<headSha>` ごとに git fetch / checkout で展開されるリモートファイル群。 */
+export const remoteRepoFiles = new Map<string, Record<string, string>>();
+
 function filesOf(sandboxId: string): Map<string, string> {
   let files = sandboxFiles.get(sandboxId);
   if (!files) {
@@ -25,6 +28,9 @@ function filesOf(sandboxId: string): Map<string, string> {
   return files;
 }
 
+const GIT_FETCH_PATTERN =
+  /git\s+-c\s+"http\.extraHeader=Authorization:\s+Basic\s+([^"]+)"\s+fetch\s+--depth\s+1\s+https:\/\/github\.com\/([^\s]+?)\.git\s+(?:--\s+)?([^\s&]+)/;
+
 /**
  * RUNNER service binding のテスト用 RPC 実装。
  * ReviewOrchestrator.ports() の sandbox は差し替えず、本番と同じく RUNNER への RPC を通す。
@@ -32,6 +38,26 @@ function filesOf(sandboxId: string): Map<string, string> {
 export class SandboxEntrypoint extends WorkerEntrypoint implements SandboxService {
   async exec(sandboxId: string, command: string): Promise<ExecResult> {
     executed.push(command);
+    const fetchMatch = command.match(GIT_FETCH_PATTERN);
+    if (fetchMatch) {
+      const [, basicAuth, repo, sha] = fetchMatch;
+      if (sha === "fail-sha") {
+        return {
+          stdout: "fetch output",
+          stderr: `fatal: authentication failed (${basicAuth})`,
+          exitCode: 128,
+        };
+      }
+      const files = filesOf(sandboxId);
+      files.clear();
+      const repoFiles = remoteRepoFiles.get(`${repo}@${sha}`) ?? remoteRepoFiles.get(sha ?? "");
+      if (repoFiles) {
+        for (const [path, content] of Object.entries(repoFiles)) {
+          files.set(path, content);
+        }
+      }
+      return { stdout: "", stderr: "", exitCode: 0 };
+    }
     if (command.startsWith("cat ")) {
       const path = command.slice("cat ".length).trim();
       const content = filesOf(sandboxId).get(path);

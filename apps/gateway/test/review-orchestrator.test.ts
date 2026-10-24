@@ -1,11 +1,22 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import type { MutableModels } from "@earendil-works/pi-ai";
-import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import {
+  type FauxResponseStep,
+  fauxAssistantMessage,
+  fauxText,
+  fauxToolCall,
+} from "@earendil-works/pi-ai/providers/faux";
 import { clearInstallationTokenCache } from "@repo/github";
 import { VAULT_INSTANCE_NAME } from "@repo/orchestrator";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { executed, faux, type ProductionOrchestrator, sandboxFiles } from "./worker.js";
+import {
+  executed,
+  faux,
+  type ProductionOrchestrator,
+  remoteRepoFiles,
+  sandboxFiles,
+} from "./worker.js";
 
 const toolCall = (name: string, args: Parameters<typeof fauxToolCall>[1]) =>
   fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
@@ -22,6 +33,7 @@ describe("ReviewOrchestrator", () => {
   beforeEach(() => {
     executed.length = 0;
     sandboxFiles.clear();
+    remoteRepoFiles.clear();
     clearInstallationTokenCache();
     vi.stubGlobal(
       "fetch",
@@ -63,7 +75,10 @@ describe("ReviewOrchestrator", () => {
 
     expect(receipt).toMatchObject({ operationId: "delivery-1", accepted: true });
     expect(result).toMatchObject({ status: "done", text: "レビュー完了" });
-    expect(executed).toEqual(["pnpm test"]);
+    expect(executed).toEqual([
+      expect.stringContaining("https://github.com/octo/repo.git -- abc123"),
+      "pnpm test",
+    ]);
     await expect(orchestrator.findings("delivery-1")).resolves.toEqual([
       {
         operationId: "delivery-1",
@@ -125,7 +140,143 @@ describe("ReviewOrchestrator", () => {
     const [sandboxId] = [...sandboxFiles.keys()];
     expect(sandboxId).toMatch(/^[0-9a-f]{64}$/);
     expect(sandboxFiles.get(sandboxId ?? "")?.get("repro.txt")).toBe("from-orchestrator");
-    expect(executed).toEqual(["cat repro.txt"]);
+    expect(executed).toEqual([
+      expect.stringContaining("https://github.com/octo/repo.git -- abc123"),
+      "cat repro.txt",
+    ]);
+  });
+
+  it("start() で PR の head をチェックアウトし、read_file でファイルが読め、token を環境変数やファイルに残さない", async () => {
+    remoteRepoFiles.set("octo/repo@abc123", {
+      "src/sum.ts": "export const sum = (ns: number[]) => ns.reduce((a, b) => a + b);\n",
+      "package.json": '{"name":"octo-repo"}\n',
+    });
+    const toolResults: Array<{ toolName: string; isError: boolean; text: string }> = [];
+    faux.setResponses([
+      toolCall("read_file", { path: "src/sum.ts" }),
+      (context) => {
+        for (const msg of context.messages) {
+          if (msg.role === "toolResult") {
+            const text = msg.content
+              .flatMap((part) => (part.type === "text" ? [part.text] : []))
+              .join("");
+            toolResults.push({ toolName: msg.toolName, isError: msg.isError, text });
+          }
+        }
+        return fauxAssistantMessage(fauxText("ファイル読み取り成功"));
+      },
+    ]);
+
+    const orchestrator = env.ORCHESTRATOR.getByName("octo/repo#6");
+    await orchestrator.start(request);
+    const result = await orchestrator.result(request.deliveryId);
+
+    expect(result).toMatchObject({ status: "done", text: "ファイル読み取り成功" });
+    expect(toolResults).toEqual([
+      {
+        toolName: "read_file",
+        isError: false,
+        text: "export const sum = (ns: number[]) => ns.reduce((a, b) => a + b);\n",
+      },
+    ]);
+
+    expect(executed).toHaveLength(1);
+    const checkoutCmd = executed[0] ?? "";
+    const expectedBasicAuth = btoa("x-access-token:ghs_inst_42");
+    expect(checkoutCmd).toContain(
+      `-c "http.extraHeader=Authorization: Basic ${expectedBasicAuth}"`,
+    );
+    expect(checkoutCmd).not.toContain("ghs_inst_42");
+    expect(checkoutCmd).not.toContain("x-access-token:");
+    expect(checkoutCmd).not.toMatch(/\bexport\b/);
+
+    for (const files of sandboxFiles.values()) {
+      for (const [path, content] of files.entries()) {
+        expect(path).not.toContain("ghs_inst_42");
+        expect(content).not.toContain("ghs_inst_42");
+        expect(content).not.toContain(expectedBasicAuth);
+      }
+    }
+  });
+
+  it("head が同じなら再利用して再取得せず、head が更新されたら取り直す", async () => {
+    remoteRepoFiles.set("octo/repo@sha-v1", { "src/sum.ts": "v1\n" });
+    remoteRepoFiles.set("octo/repo@sha-v2", { "src/sum.ts": "v2\n" });
+    const readOutputs: string[] = [];
+
+    const captureLastRead: FauxResponseStep = (context) => {
+      const lastToolResult = [...context.messages].reverse().find((m) => m.role === "toolResult");
+      const text =
+        lastToolResult?.content.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("") ?? "";
+      readOutputs.push(text);
+      return fauxAssistantMessage(fauxText(`read:${text.trim()}`));
+    };
+
+    const orchestrator = env.ORCHESTRATOR.getByName("octo/repo#7");
+
+    // 1 回目: sha-v1 をチェックアウトし、作業ファイル repro.txt も作る
+    faux.setResponses([
+      toolCall("write_file", { path: "repro.txt", content: "local-repro" }),
+      toolCall("read_file", { path: "src/sum.ts" }),
+      captureLastRead,
+    ]);
+    await orchestrator.start({ ...request, deliveryId: "del-v1-a", headSha: "sha-v1" });
+    await orchestrator.result("del-v1-a");
+    expect(executed).toHaveLength(1);
+    expect(readOutputs).toEqual(["v1\n"]);
+
+    // 2 回目: 同じ sha-v1 の別 delivery → 再取得せず、前回の repro.txt も残っている
+    faux.setResponses([toolCall("read_file", { path: "repro.txt" }), captureLastRead]);
+    await orchestrator.start({ ...request, deliveryId: "del-v1-b", headSha: "sha-v1" });
+    await orchestrator.result("del-v1-b");
+    expect(executed).toHaveLength(1);
+    expect(readOutputs).toEqual(["v1\n", "local-repro"]);
+
+    // 3 回目: sha-v2 に更新 → 取り直され、src/sum.ts が v2 になり repro.txt は消える
+    faux.setResponses([toolCall("read_file", { path: "src/sum.ts" }), captureLastRead]);
+    await orchestrator.start({ ...request, deliveryId: "del-v2", headSha: "sha-v2" });
+    await orchestrator.result("del-v2");
+    expect(executed).toHaveLength(2);
+    expect(executed[1]).toContain("https://github.com/octo/repo.git -- sha-v2");
+    expect(readOutputs).toEqual(["v1\n", "local-repro", "v2\n"]);
+    const [sandboxId] = [...sandboxFiles.keys()];
+    expect(sandboxFiles.get(sandboxId ?? "")?.has("repro.txt")).toBe(false);
+  });
+
+  it("チェックアウト失敗時はトークンをマスクして例外を投げ、次回は再取得を試みる", async () => {
+    const stub = env.ORCHESTRATOR.getByName("octo/repo#8");
+    const expectedBasicAuth = btoa("x-access-token:ghs_inst_42");
+
+    await runInDurableObject(stub, async (instance) => {
+      const orchestrator = instance as ProductionOrchestrator;
+      await expect(
+        orchestrator.start({ ...request, deliveryId: "del-fail", headSha: "fail-sha" }),
+      ).rejects.toSatisfy((error: unknown) => {
+        const msg = error instanceof Error ? error.message : String(error);
+        expect(msg).toContain("failed to checkout octo/repo@fail-sha (exit 128)");
+        expect(msg).toContain("[REDACTED]");
+        expect(msg).toContain("fetch output");
+        expect(msg).not.toContain("ghs_inst_42");
+        expect(msg).not.toContain(expectedBasicAuth);
+        return true;
+      });
+
+      await expect(
+        orchestrator.start({
+          ...request,
+          deliveryId: "del-bad-ref",
+          headSha: "--upload-pack=evil",
+        }),
+      ).rejects.toThrow("invalid headSha");
+    });
+
+    // 失敗後は checked_out_sha が記録されないため、続く正常なリクエストで取得が走る
+    remoteRepoFiles.set("octo/repo@abc123", { "src/sum.ts": "recovered\n" });
+    faux.setResponses([fauxAssistantMessage(fauxText("復旧"))]);
+    const receipt = await stub.start({ ...request, deliveryId: "del-recover" });
+    const result = await stub.result("del-recover");
+    expect(receipt.accepted).toBe(true);
+    expect(result).toMatchObject({ status: "done", text: "復旧" });
   });
 
   it("ports().github を差し替えず get_diff / post_review / resolve_thread の 3 操作が installation token 経由で GitHub API に届く", async () => {

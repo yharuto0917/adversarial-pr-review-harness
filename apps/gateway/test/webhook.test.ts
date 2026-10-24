@@ -1,6 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { fauxAssistantMessage, fauxText } from "@earendil-works/pi-ai/providers/faux";
-import { describe, expect, it } from "vitest";
+import { clearInstallationTokenCache } from "@repo/github";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { faux } from "./worker.js";
 
@@ -40,6 +41,25 @@ function makePullRequestPayload(
 }
 
 describe("POST /webhook/github", () => {
+  beforeEach(() => {
+    clearInstallationTokenCache();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/app/installations/777/access_tokens")) {
+          const expiresAt = new Date(Date.now() + 3600_000).toISOString();
+          return Response.json({ token: "ghs_inst_777", expires_at: expiresAt }, { status: 201 });
+        }
+        return new Response("unexpected url", { status: 404 });
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it.each([
     ["署名ヘッダなし", undefined],
     ["誤った署名", "sha256=0000000000000000000000000000000000000000000000000000000000000000"],

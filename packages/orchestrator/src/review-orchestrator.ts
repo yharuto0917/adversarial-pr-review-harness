@@ -50,7 +50,11 @@ interface ReviewTarget {
   readonly pullNumber: number;
   readonly headSha: string;
   readonly installationId: number;
+  readonly checkedOutSha: string | null;
 }
+
+const SAFE_REPOSITORY = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
 /**
  * PR 単位のレビューを担う Durable Object。
@@ -84,14 +88,21 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
       repository TEXT NOT NULL,
       pull_number INTEGER NOT NULL,
       head_sha TEXT NOT NULL,
-      installation_id INTEGER NOT NULL
+      installation_id INTEGER NOT NULL,
+      checked_out_sha TEXT
     )`);
   }
 
   /** レビューを開始する。モデルが動く前に、入力を永続化した時点で返る。 */
   async start(request: ReviewRequest): Promise<PiReceipt> {
+    if (!SAFE_REPOSITORY.test(request.repository) || request.repository.includes("..")) {
+      throw new Error(`invalid repository: ${request.repository}`);
+    }
+    if (!SAFE_REF.test(request.headSha) || request.headSha.includes("..")) {
+      throw new Error(`invalid headSha: ${request.headSha}`);
+    }
     this.#saveTarget(request);
-    // TODO: サンドボックスに PR の head をチェックアウトする（installation token が要る）
+    await this.#checkoutHead();
     return this.harness.submit(
       `${request.repository} の Pull Request #${request.pullNumber}（head: ${request.headSha}）をレビューしてください。`,
       { operationId: request.deliveryId },
@@ -140,12 +151,7 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
       return createPullRequestClient({
         repository: target.repository,
         pullNumber: target.pullNumber,
-        getToken: () =>
-          issueInstallationToken({
-            appId: this.env.GITHUB_APP_ID,
-            privateKey: this.env.GITHUB_APP_PRIVATE_KEY,
-            installationId: target.installationId,
-          }),
+        getToken: () => this.#getInstallationToken(target.installationId),
       });
     };
     return {
@@ -155,10 +161,62 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
     };
   }
 
+  /**
+   * PR の head をサンドボックスのカレントディレクトリへチェックアウトする。
+   * 同じ head が既にチェックアウト済みなら再利用し、更新されたら取り直す。
+   * installation token は一時 HTTP ヘッダとして渡し、環境変数や `.git/config` 等には残さない。
+   */
+  async #checkoutHead(): Promise<void> {
+    const target = this.#requireTarget();
+    if (target.checkedOutSha === target.headSha) {
+      return;
+    }
+
+    const token = await this.#getInstallationToken(target.installationId);
+    const basicAuth = btoa(`x-access-token:${token}`);
+    const repoUrl = `https://github.com/${target.repository}.git`;
+    const command = [
+      "git init -q",
+      `git -c "http.extraHeader=Authorization: Basic ${basicAuth}" fetch --depth 1 ${repoUrl} -- ${target.headSha}`,
+      "git checkout -q --force FETCH_HEAD",
+      "git clean -fdx -q",
+    ].join(" && ");
+
+    const result = await this.ports().sandbox.exec(command);
+    if (result.exitCode !== 0) {
+      const rawOutput = [result.stderr, result.stdout].filter(Boolean).join("\n");
+      const detail = redactSecrets(rawOutput, [token, basicAuth]).trim();
+      throw new Error(
+        `failed to checkout ${target.repository}@${target.headSha} (exit ${result.exitCode})${detail ? `: ${detail}` : ""}`,
+      );
+    }
+
+    this.ctx.storage.sql.exec(
+      "UPDATE review_target SET checked_out_sha = ? WHERE id = 1",
+      target.headSha,
+    );
+  }
+
+  #getInstallationToken(installationId: number): Promise<string> {
+    return issueInstallationToken({
+      appId: this.env.GITHUB_APP_ID,
+      privateKey: this.env.GITHUB_APP_PRIVATE_KEY,
+      installationId,
+    });
+  }
+
   #saveTarget(request: ReviewRequest): void {
     this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO review_target (id, repository, pull_number, head_sha, installation_id)
-       VALUES (1, ?, ?, ?, ?)`,
+      `INSERT INTO review_target (id, repository, pull_number, head_sha, installation_id, checked_out_sha)
+       VALUES (1, ?, ?, ?, ?, NULL)
+       ON CONFLICT(id) DO UPDATE SET
+         repository = excluded.repository,
+         pull_number = excluded.pull_number,
+         head_sha = excluded.head_sha,
+         installation_id = CASE
+           WHEN excluded.installation_id != 0 THEN excluded.installation_id
+           ELSE review_target.installation_id
+         END`,
       request.repository,
       request.pullNumber,
       request.headSha,
@@ -173,8 +231,9 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
         pull_number: number;
         head_sha: string;
         installation_id: number;
+        checked_out_sha: string | null;
       }>(
-        "SELECT repository, pull_number, head_sha, installation_id FROM review_target WHERE id = 1",
+        "SELECT repository, pull_number, head_sha, installation_id, checked_out_sha FROM review_target WHERE id = 1",
       )
       .toArray()[0];
     if (!row) {
@@ -185,6 +244,7 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
       pullNumber: row.pull_number,
       headSha: row.head_sha,
       installationId: row.installation_id,
+      checkedOutSha: row.checked_out_sha,
     };
   }
 
@@ -196,4 +256,14 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
     }
     return running.operationId;
   }
+}
+
+function redactSecrets(input: string, secrets: readonly string[]): string {
+  let output = input;
+  for (const secret of secrets) {
+    if (secret.length > 0) {
+      output = output.replaceAll(secret, "[REDACTED]");
+    }
+  }
+  return output;
 }
