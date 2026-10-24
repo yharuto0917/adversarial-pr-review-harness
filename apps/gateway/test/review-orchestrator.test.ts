@@ -180,7 +180,7 @@ describe("ReviewOrchestrator", () => {
       },
     ]);
 
-    expect(executed).toHaveLength(1);
+    expect(executed).toEqual([expect.any(String), "npm install"]);
     const checkoutCmd = executed[0] ?? "";
     const expectedBasicAuth = btoa("x-access-token:ghs_inst_42");
     expect(checkoutCmd).toContain(
@@ -277,6 +277,169 @@ describe("ReviewOrchestrator", () => {
     const result = await stub.result("del-recover");
     expect(receipt.accepted).toBe(true);
     expect(result).toMatchObject({ status: "done", text: "復旧" });
+  });
+
+  it.each([
+    {
+      label: "pnpm",
+      pullNumber: 901,
+      sha: "sha-pnpm",
+      files: {
+        "package.json": JSON.stringify({
+          name: "pnpm-app",
+          packageManager: "pnpm@11.25.0",
+          scripts: { test: "vitest run", typecheck: "tsc --noEmit" },
+        }),
+        "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+      },
+      expectedInstall: "pnpm install --frozen-lockfile",
+      expectedHint: "テストコマンドの候補: pnpm test, pnpm run typecheck",
+      testCmd: "pnpm test",
+    },
+    {
+      label: "yarn",
+      pullNumber: 902,
+      sha: "sha-yarn",
+      files: {
+        "package.json": JSON.stringify({
+          name: "yarn-app",
+          scripts: { test: "jest" },
+        }),
+        "yarn.lock": "# yarn lockfile v1\n",
+      },
+      expectedInstall: "yarn install --frozen-lockfile",
+      expectedHint: "テストコマンドの候補: yarn test",
+      testCmd: "yarn test",
+    },
+    {
+      label: "npm",
+      pullNumber: 903,
+      sha: "sha-npm",
+      files: {
+        "package.json": JSON.stringify({
+          name: "npm-app",
+          scripts: { test: "node --test", "test:unit": "node --test src/" },
+        }),
+        "package-lock.json": '{"lockfileVersion":3}\n',
+      },
+      expectedInstall: "npm ci",
+      expectedHint: "テストコマンドの候補: npm test, npm run test:unit",
+      testCmd: "npm test",
+    },
+  ])(
+    "Node プロジェクト ($label) で依存をインストールし、テストコマンド候補をモデルに示して exec からテストを実行できる",
+    async ({ pullNumber, sha, files, expectedInstall, expectedHint, testCmd }) => {
+      remoteRepoFiles.set(`octo/repo@${sha}`, files);
+      const userPrompts: string[] = [];
+      const execOutputs: Array<{ isError: boolean; text: string }> = [];
+
+      faux.setResponses([
+        (context) => {
+          const lastUser = [...context.messages].reverse().find((m) => m.role === "user");
+          const promptText =
+            typeof lastUser?.content === "string"
+              ? lastUser.content
+              : (lastUser?.content.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("") ??
+                "");
+          userPrompts.push(promptText);
+          return toolCall("exec", { command: testCmd });
+        },
+        (context) => {
+          const lastTool = [...context.messages].reverse().find((m) => m.role === "toolResult");
+          const text =
+            lastTool?.content.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("") ?? "";
+          execOutputs.push({ isError: lastTool?.isError ?? true, text });
+          return fauxAssistantMessage(fauxText("テスト成功"));
+        },
+      ]);
+
+      const orchestrator = env.ORCHESTRATOR.getByName(`octo/repo#${pullNumber}`);
+      await orchestrator.start({
+        ...request,
+        deliveryId: `del-${sha}-1`,
+        pullNumber,
+        headSha: sha,
+      });
+      const result = await orchestrator.result(`del-${sha}-1`);
+
+      expect(result).toMatchObject({ status: "done", text: "テスト成功" });
+      expect(executed).toEqual([
+        expect.stringContaining(`https://github.com/octo/repo.git -- ${sha}`),
+        expectedInstall,
+        testCmd,
+      ]);
+      expect(userPrompts[0]).toContain(expectedHint);
+      expect(execOutputs).toEqual([
+        {
+          isError: false,
+          text: `exit code: 0\n--- stdout ---\nPASS (${testCmd})`,
+        },
+      ]);
+
+      // 同じ headSha の別 delivery では再インストールせず、テストコマンド候補の提示は維持される
+      faux.setResponses([
+        (context) => {
+          const lastUser = [...context.messages].reverse().find((m) => m.role === "user");
+          const promptText =
+            typeof lastUser?.content === "string"
+              ? lastUser.content
+              : (lastUser?.content.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("") ??
+                "");
+          userPrompts.push(promptText);
+          return fauxAssistantMessage(fauxText("2回目完了"));
+        },
+      ]);
+      await orchestrator.start({
+        ...request,
+        deliveryId: `del-${sha}-2`,
+        pullNumber,
+        headSha: sha,
+      });
+      await orchestrator.result(`del-${sha}-2`);
+      expect(executed).toHaveLength(3);
+      expect(userPrompts[1]).toContain(expectedHint);
+    },
+  );
+
+  it("依存インストール失敗時は例外を投げて checked_out_sha を残さず、次回リクエストで再取得・再インストールを試みる", async () => {
+    remoteRepoFiles.set("octo/repo@sha-ok", {
+      "package.json": JSON.stringify({ name: "app", scripts: { test: "vitest run" } }),
+      "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    });
+    remoteRepoFiles.set("octo/repo@sha-broken-install", {
+      "package.json": JSON.stringify({ name: "fail-install", scripts: { test: "vitest run" } }),
+      "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    });
+
+    const stub = env.ORCHESTRATOR.getByName("octo/repo#910");
+
+    // 1. まず sha-ok で成功させる
+    faux.setResponses([fauxAssistantMessage(fauxText("ok-1"))]);
+    await stub.start({ ...request, deliveryId: "del-ok-1", pullNumber: 910, headSha: "sha-ok" });
+    await stub.result("del-ok-1");
+    expect(executed).toHaveLength(2);
+
+    // 2. sha-broken-install で依存インストールが失敗 → checked_out_sha はクリアされる
+    await runInDurableObject(stub, async (instance) => {
+      const orchestrator = instance as ProductionOrchestrator;
+      await expect(
+        orchestrator.start({
+          ...request,
+          deliveryId: "del-broken",
+          pullNumber: 910,
+          headSha: "sha-broken-install",
+        }),
+      ).rejects.toThrow(
+        'failed to install dependencies with "pnpm install --frozen-lockfile" (exit 1): ERR_INSTALL_FAILED: registry error',
+      );
+    });
+
+    // 3. 再び sha-ok に戻した際、古い checked_out_sha が残っていないため再取得・再インストールが走る
+    faux.setResponses([fauxAssistantMessage(fauxText("ok-2"))]);
+    await stub.start({ ...request, deliveryId: "del-ok-2", pullNumber: 910, headSha: "sha-ok" });
+    const result = await stub.result("del-ok-2");
+    expect(result).toMatchObject({ status: "done", text: "ok-2" });
+    expect(executed).toHaveLength(6);
   });
 
   it("ports().github を差し替えず get_diff / post_review / resolve_thread の 3 操作が installation token 経由で GitHub API に届く", async () => {

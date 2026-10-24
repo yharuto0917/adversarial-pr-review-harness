@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const sandboxStub = {
@@ -70,5 +73,26 @@ describe("SandboxEntrypoint", () => {
     expect(getSandboxMock).toHaveBeenCalledWith(namespace, "a".repeat(63), {
       normalizeId: true,
     });
+  });
+});
+
+describe("Dockerfile", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const dockerfile = readFileSync(resolve(here, "../Dockerfile"), "utf8");
+  const sandboxPkg = JSON.parse(
+    readFileSync(resolve(here, "../node_modules/@cloudflare/sandbox/package.json"), "utf8"),
+  ) as { version: string };
+  const rootPkg = JSON.parse(readFileSync(resolve(here, "../../../package.json"), "utf8")) as {
+    packageManager: string;
+  };
+
+  it("ベースイメージのタグが @cloudflare/sandbox のバージョンと一致する", () => {
+    expect(dockerfile).toContain(`FROM docker.io/cloudflare/sandbox:${sandboxPkg.version}`);
+  });
+
+  it("npm に加えて pnpm と yarn をグローバルインストールする", () => {
+    expect(dockerfile).toContain(rootPkg.packageManager);
+    expect(dockerfile).toMatch(/RUN\s+npm\s+install\s+-g\b.*\bpnpm@[\d.]+/);
+    expect(dockerfile).toMatch(/RUN\s+npm\s+install\s+-g\b.*\byarn@[\d.]+/);
   });
 });
