@@ -8,6 +8,10 @@
   "files": {
     "includes": [
       "**",
+      "!.agents",
+      "!.gemini",
+      "!skills",
+      "!skills-lock.json",
       "!**/worker-configuration.d.ts",
       "!**/next-env.d.ts",
       "!**/cloudflare-env.d.ts"
