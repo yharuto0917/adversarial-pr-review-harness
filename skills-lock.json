@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "caveman-review": {
+      "source": "juliusbrussee/caveman",
+      "sourceType": "github",
+      "skillPath": "skills/caveman-review/SKILL.md",
+      "computedHash": "36a4007c5c0c6b90b5accfee1cd769a86e4963b651dece2ce5f17a223a0abb4b"
+    },
+    "clipboardCopy": {
+      "source": "yharuto0917/clipboard-copy-skill",
+      "sourceType": "github",
+      "skillPath": "skills/SKILL.md",
+      "computedHash": "af1405af8b74bbeb8f0dc2ba8238aa9ecec36e703606c5b00b0dab6ae82a16ca"
+    }
+  }
+}
