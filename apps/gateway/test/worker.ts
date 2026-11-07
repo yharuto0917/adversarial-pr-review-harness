@@ -31,6 +31,12 @@ function filesOf(sandboxId: string): Map<string, string> {
 const GIT_FETCH_PATTERN =
   /git\s+-c\s+"http\.extraHeader=Authorization:\s+Basic\s+([^"]+)"\s+fetch\s+--depth\s+1\s+https:\/\/github\.com\/([^\s]+?)\.git\s+(?:--\s+)?([^\s&]+)/;
 
+const INSTALL_COMMAND_PATTERN =
+  /^(?:corepack\s+(?:npm|pnpm|yarn)@[0-9A-Za-z.-]+\s+|(?:npm|pnpm|yarn)\s+)(?:ci|install(?: --frozen-lockfile)?)$/;
+
+const TEST_COMMAND_PATTERN =
+  /^(?:corepack\s+(?:npm|pnpm|yarn)@[0-9A-Za-z.-]+\s+|(?:npm|pnpm|yarn)\s+)(?:test|run\s+\S+)$/;
+
 /**
  * RUNNER service binding のテスト用 RPC 実装。
  * ReviewOrchestrator.ports() の sandbox は差し替えず、本番と同じく RUNNER への RPC を通す。
@@ -57,6 +63,25 @@ export class SandboxEntrypoint extends WorkerEntrypoint implements SandboxServic
         }
       }
       return { stdout: "", stderr: "", exitCode: 0 };
+    }
+    if (INSTALL_COMMAND_PATTERN.test(command)) {
+      const files = filesOf(sandboxId);
+      if (files.get("package.json")?.includes('"fail-install"')) {
+        return {
+          stdout: "",
+          stderr: "ERR_INSTALL_FAILED: registry error",
+          exitCode: 1,
+        };
+      }
+      files.set("node_modules/.installed", command);
+      return { stdout: `installed via ${command}`, stderr: "", exitCode: 0 };
+    }
+    if (TEST_COMMAND_PATTERN.test(command) && filesOf(sandboxId).has("node_modules/.installed")) {
+      return {
+        stdout: `PASS (${command})`,
+        stderr: "",
+        exitCode: 0,
+      };
     }
     if (command.startsWith("cat ")) {
       const path = command.slice("cat ".length).trim();
