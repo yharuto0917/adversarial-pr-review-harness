@@ -63,9 +63,16 @@ describe("classifyClaim", () => {
     "`pnpm test`",
     "ファイルを読み取りました。",
     "問題は再現しなかった。",
+    "問題は再現しなかった (exit code 0).",
     "Could not reproduce the issue.",
+    "テストが通ったことを確認できませんでした。",
+    "テストが通ったかどうかは不明です。",
+    "テストが通ったとは限らない。",
+    "Not all tests passed.",
+    "修正前はテストが通らなかったが、修正後はすべて通った。",
+    "最初は再現しなかったが、条件を変えると再現した。",
     "テストがすべて通ったが、同じコマンドでテストが失敗して再現した。",
-  ])("意図が特定できない・否定・矛盾する宣言 (%s) は null を返す", (claim) => {
+  ])("意図が特定できない・不確実・否定・矛盾する宣言 (%s) は null を返す", (claim) => {
     expect(classifyClaim(claim)).toBeNull();
   });
 });
@@ -75,7 +82,7 @@ describe("extractClaimCommands", () => {
     const claim = [
       "`src/sum.ts` を確認し、`pnpm test` と `pnpm run typecheck` を実行した。",
       "念のためもう一度 `pnpm test` と `npx vitest run src/sum.test.ts` を走らせた。",
-      "`corepack pnpm@11.25.0 test` および `go test ./...` も通過した。",
+      "`corepack pnpm@11.25.0 test` および `go test ./...`、`node repro.mjs`、`npx tsx repro.ts` も通過した。",
     ].join("\n");
 
     expect(extractClaimCommands(claim)).toEqual([
@@ -84,12 +91,16 @@ describe("extractClaimCommands", () => {
       "npx vitest run src/sum.test.ts",
       "corepack pnpm@11.25.0 test",
       "go test ./...",
+      "node repro.mjs",
+      "npx tsx repro.ts",
     ]);
   });
 
-  it("シェルメタ文字を含むインラインコードやコマンドではない識別子は除外する", () => {
-    const claim =
-      "`pnpm test; rm -rf /` や `pnpm test && curl https://example.com` や `verifyCompletionClaim` は無視し、`npm test` のみ抽出する。";
+  it("シェルメタ文字を含むインラインコードや引数なしの node / npx tsx、コマンドではない識別子は除外する", () => {
+    const claim = [
+      "`pnpm test; rm -rf /` や `pnpm test && curl https://example.com` や `verifyCompletionClaim` は無視する。",
+      "引数なしの `node` を実行したり `npx tsx` で確認したという記述も除外し、`npm test` のみ抽出する。",
+    ].join("\n");
 
     expect(extractClaimCommands(claim)).toEqual(["npm test"]);
   });
@@ -209,7 +220,35 @@ describe("verifyCompletionClaim", () => {
     );
   });
 
-  it("宣言文中にコマンドが書かれていない場合は package.json からテストコマンドを自動検出して検証する", async () => {
+  it("宣言文中にコマンドが書かれておらず「テストが通った」とだけ宣言された場合は test / test:* のみを自動検出し、lint や check は実行しない", async () => {
+    const { sandbox, executed } = createFakeSandbox({
+      files: {
+        "package.json": JSON.stringify({
+          name: "sample",
+          scripts: {
+            test: "vitest run",
+            "test:unit": "vitest run src/unit",
+            typecheck: "tsc --noEmit",
+            check: "biome check --write .",
+            lint: "biome lint .",
+          },
+        }),
+        "pnpm-lock.yaml": "lockfileVersion: '9.0'",
+      },
+      execResults: {
+        "pnpm test": { stdout: "1 passed", stderr: "", exitCode: 0 },
+        "pnpm run test:unit": { stdout: "1 passed", stderr: "", exitCode: 0 },
+        "pnpm run lint": { stdout: "", stderr: "lint failed", exitCode: 1 },
+      },
+    });
+
+    const result = await verifyCompletionClaim(sandbox, "すべてのテストが通った。");
+
+    expect(result.passed).toBe(true);
+    expect(executed).toEqual(["pnpm test", "pnpm run test:unit"]);
+  });
+
+  it("宣言文中で型チェックにも言及している場合は package.json から typecheck も含めて検証する", async () => {
     const { sandbox, executed } = createFakeSandbox({
       files: {
         "package.json": JSON.stringify({
@@ -217,6 +256,7 @@ describe("verifyCompletionClaim", () => {
           scripts: {
             test: "vitest run",
             typecheck: "tsc --noEmit",
+            lint: "biome lint .",
           },
         }),
         "pnpm-lock.yaml": "lockfileVersion: '9.0'",
@@ -240,7 +280,22 @@ describe("verifyCompletionClaim", () => {
     );
   });
 
-  it("空の宣言・意図不明な宣言・コマンド特定不能・危険な明示コマンドの場合は exec を呼ばずに passed: false を返す", async () => {
+  it("壊れた package.json の場合でも例外を投げず passed: false と evidence を返す", async () => {
+    const { sandbox, executed } = createFakeSandbox({
+      files: {
+        "package.json": "{ broken json",
+      },
+    });
+
+    const result = await verifyCompletionClaim(sandbox, "すべてのテストが通った。");
+
+    expect(result.passed).toBe(false);
+    expect(executed).toEqual([]);
+    expect(result.evidence[0]).toBe("claim expectation: passed");
+    expect(result.evidence[1]).toMatch(/^failed to inspect project: failed to parse package\.json/);
+  });
+
+  it("空の宣言・意図不明な宣言・コマンド特定不能・allowlist 外の明示コマンドの場合は exec を呼ばずに passed: false を返す", async () => {
     const { sandbox, executed } = createFakeSandbox({
       files: { "README.md": "# docs only" },
     });
@@ -268,10 +323,29 @@ describe("verifyCompletionClaim", () => {
       ],
     });
 
-    const unsafeOptionResult = await verifyCompletionClaim(sandbox, "すべてのテストが通った。", {
-      commands: ["pnpm test; rm -rf /"],
+    const disallowedCommandResult = await verifyCompletionClaim(
+      sandbox,
+      "すべてのテストが通った。",
+      {
+        commands: ["rm -rf /"],
+      },
+    );
+    expect(disallowedCommandResult).toEqual({
+      passed: false,
+      evidence: [
+        "claim expectation: passed",
+        'rejected unsafe or empty verification command: "rm -rf /"',
+      ],
     });
-    expect(unsafeOptionResult).toEqual({
+
+    const shellMetaCommandResult = await verifyCompletionClaim(
+      sandbox,
+      "すべてのテストが通った。",
+      {
+        commands: ["pnpm test; rm -rf /"],
+      },
+    );
+    expect(shellMetaCommandResult).toEqual({
       passed: false,
       evidence: [
         "claim expectation: passed",

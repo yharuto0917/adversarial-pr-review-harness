@@ -21,7 +21,7 @@ const MAX_EVIDENCE_OUTPUT_LENGTH = 500;
 const SHELL_META_CHARS = /[;&|`$><\r\n\\]/;
 
 const SAFE_COMMAND_PATTERN =
-  /^(?:(?:corepack\s+)?(?:pnpm|yarn|npm)(?:@[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)?\s+(?:test|run\s+[A-Za-z0-9_.:-]+)|(?:npx|pnpx|bunx)\s+(?:vitest|jest|mocha|ava|tsx|tsc)|(?:vitest|jest|mocha|pytest|cargo\s+test|go\s+test|node|bun\s+test|deno\s+test))(?:\s+[A-Za-z0-9_./:@=-]+)*$/;
+  /^(?:(?:(?:corepack\s+)?(?:pnpm|yarn|npm)(?:@[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)?\s+(?:test|run\s+[A-Za-z0-9_.:-]+)|(?:npx|pnpx|bunx)\s+(?:vitest|jest|mocha|ava|tsc)|(?:vitest|jest|mocha|pytest|cargo\s+test|go\s+test|bun\s+test|deno\s+test))(?:\s+[A-Za-z0-9_./:@=-]+)*|(?:(?:npx|pnpx|bunx)\s+tsx|node)(?:\s+[A-Za-z0-9_./:@=-]+)+)$/;
 
 const PASSED_PATTERNS: readonly RegExp[] = [
   /テスト(?:が|は|も)?(?:すべて|全て|全部)?(?:通った|通りました|(?:通過|成功|パス)(?:した|しました|している|しています|を確認))/,
@@ -31,19 +31,22 @@ const PASSED_PATTERNS: readonly RegExp[] = [
   /正常に(?:完了|終了|通過|動作)(?:した|しました|している|しています)/,
   /(?<!not\s)(?<!never\s)\b(?:all\s+)?tests?\s+(?:passed|pass|succeeded|succeed)\b/i,
   /(?<!not\s)\bpassed\s+all\s+tests?\b/i,
-  /\bexit(?:ed)?\s+(?:with\s+)?(?:code\s+)?0\b/i,
 ];
 
-const REPRODUCED_PATTERNS: readonly RegExp[] = [
+const EXIT_ZERO_PATTERN = /\bexit(?:ed)?\s+(?:with\s+)?(?:code\s+)?0\b/i;
+
+const REPRODUCED_DIRECT_PATTERNS: readonly RegExp[] = [
   /再現(?:した|しました|できた|できました|を確認|することを確認|テストが失敗)(?!しなかった|できなかった)/,
   /(?:失敗|エラー|例外|クラッシュ|落ちる|落ちた)(?:した|しました|することを確認|を確認|が発生|になる|になった|を再現)/,
-  /テスト(?:が|は|も)?(?:失敗|落ちた|落ちました|通らない|通らなかった)/,
-  /通らなかった|(?:通過|成功|パス)(?:しなかった|しない|せず)/,
+  /テスト(?:が|は|も)?(?:失敗|落ちた|落ちました)/,
   /(?<!not\s)(?<!never\s)\b(?:reproduced|reproduces|reproduction\s+(?:succeeded|confirmed))\b/i,
   /(?<!not\s)\btests?\s+(?:failed|fails|failing)\b/i,
   /\bfails?\s+with\b/i,
   /\bexit(?:ed)?\s+(?:with\s+)?(?:code\s+)?[1-9]\d*\b/i,
 ];
+
+const HEDGED_PATTERN =
+  /確認(?:でき(?:なかった|ない|ません|ませんでした)|できず)|かどうか|(?:とは|とも)限らない|不明|わからない|分からない|未確認|確証(?:が|は)ない|\b(?:not\s+all\s+tests?\s+(?:passed|pass|succeeded|succeed)|unclear|unknown|unsure|not\s+sure|(?:cannot|could\s+not|unable\s+to)\s+(?:confirm|verify))\b/i;
 
 const NEGATED_REPRODUCED_PATTERN =
   /再現(?:しなかった|しない|しません|できなかった|できない|できません|せず)|\b(?:not|never|cannot|could\s+not)\s+reproduce(?:d)?\b/i;
@@ -51,9 +54,13 @@ const NEGATED_REPRODUCED_PATTERN =
 const NEGATED_PASSED_PATTERN =
   /通らなかった|通らない|(?:通過|成功|パス)(?:しなかった|しない|しません|せず)|\btests?\s+did\s+not\s+(?:pass|succeed)\b/i;
 
+const TYPECHECK_MENTION_PATTERN = /type-?check|\btsc\b|型チェック|型検査/i;
+const LINT_MENTION_PATTERN = /\blint(?:ing)?\b|\beslint\b|\bbiome\s+lint\b|リント/i;
+const CHECK_MENTION_PATTERN = /\bcheck(?::ci)?\b|\bbiome\s+check\b/i;
+
 /**
  * 宣言文からモデルが主張している期待結果（「テストが通った」か「問題が再現した」か）を判定する。
- * どちらとも判別できない場合や、双方の主張が矛盾して含まれる場合は `null` を返す。
+ * どちらとも判別できない場合や、不確実な表現・双方の主張が矛盾して含まれる場合は `null` を返す。
  */
 export function classifyClaim(claim: string): ClaimExpectation | null {
   const stripped = claim.replace(/`[^`]*`/g, " ").trim();
@@ -61,13 +68,39 @@ export function classifyClaim(claim: string): ClaimExpectation | null {
     return null;
   }
 
+  if (HEDGED_PATTERN.test(stripped)) {
+    return null;
+  }
+
   const hasNegatedPassed = NEGATED_PASSED_PATTERN.test(stripped);
   const hasNegatedReproduced = NEGATED_REPRODUCED_PATTERN.test(stripped);
 
-  const matchesPassed =
-    !hasNegatedPassed && PASSED_PATTERNS.some((pattern) => pattern.test(stripped));
-  const matchesReproduced =
-    !hasNegatedReproduced && REPRODUCED_PATTERNS.some((pattern) => pattern.test(stripped));
+  const withoutNegatedPassed = stripped.replace(
+    new RegExp(NEGATED_PASSED_PATTERN.source, "gi"),
+    " ",
+  );
+  const withoutNegatedReproduced = stripped.replace(
+    new RegExp(NEGATED_REPRODUCED_PATTERN.source, "gi"),
+    " ",
+  );
+
+  const hasExplicitPassed =
+    PASSED_PATTERNS.some((pattern) => pattern.test(withoutNegatedPassed)) ||
+    (!hasNegatedPassed && !hasNegatedReproduced && EXIT_ZERO_PATTERN.test(stripped));
+
+  const hasDirectReproduced = REPRODUCED_DIRECT_PATTERNS.some((pattern) =>
+    pattern.test(withoutNegatedReproduced),
+  );
+
+  if (hasExplicitPassed && hasNegatedPassed) {
+    return null;
+  }
+  if (hasDirectReproduced && hasNegatedReproduced) {
+    return null;
+  }
+
+  const matchesPassed = !hasNegatedPassed && hasExplicitPassed;
+  const matchesReproduced = !hasNegatedReproduced && (hasDirectReproduced || hasNegatedPassed);
 
   if (matchesPassed && matchesReproduced) {
     return null;
@@ -208,7 +241,7 @@ async function resolveVerificationCommands(
     const normalized: string[] = [];
     for (const raw of explicitCommands) {
       const trimmed = raw.trim();
-      if (trimmed.length === 0 || SHELL_META_CHARS.test(trimmed)) {
+      if (trimmed.length === 0 || !isSafeVerificationCommand(trimmed)) {
         return {
           ok: false,
           reason: `rejected unsafe or empty verification command: "${raw}"`,
@@ -224,20 +257,54 @@ async function resolveVerificationCommands(
     return { ok: true, commands: fromClaim };
   }
 
-  const rootFiles = await sandbox.listFiles(".");
-  const normalizedFiles = rootFiles.map((file) => file.replace(/^\.\//, ""));
-  if (normalizedFiles.includes("package.json")) {
-    const packageJsonContent = await sandbox.readFile("package.json");
-    const project = detectNodeProject(packageJsonContent, normalizedFiles);
-    if (project.testCommands.length > 0) {
-      return { ok: true, commands: project.testCommands };
+  try {
+    const rootFiles = await sandbox.listFiles(".");
+    const normalizedFiles = rootFiles.map((file) => file.replace(/^\.\//, ""));
+    if (normalizedFiles.includes("package.json")) {
+      const packageJsonContent = await sandbox.readFile("package.json");
+      const project = detectNodeProject(packageJsonContent, normalizedFiles);
+      const selectedCommands = filterProjectVerificationCommands(project.testCommands, claim);
+      if (selectedCommands.length > 0) {
+        return { ok: true, commands: selectedCommands };
+      }
     }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      reason: `failed to inspect project: ${reason}`,
+    };
   }
 
   return {
     ok: false,
     reason: "no verification command could be determined from claim or project",
   };
+}
+
+function filterProjectVerificationCommands(
+  testCommands: readonly string[],
+  claim: string,
+): string[] {
+  const includeTypecheck = TYPECHECK_MENTION_PATTERN.test(claim);
+  const includeLint = LINT_MENTION_PATTERN.test(claim);
+  const includeCheck = CHECK_MENTION_PATTERN.test(claim);
+
+  return testCommands.filter((command) => {
+    if (command.endsWith(" test") || /\srun\s+test:/.test(command)) {
+      return true;
+    }
+    if (command.endsWith(" run typecheck") || command.endsWith(" run type-check")) {
+      return includeTypecheck;
+    }
+    if (command.endsWith(" run lint")) {
+      return includeLint;
+    }
+    if (command.endsWith(" run check") || command.endsWith(" run check:ci")) {
+      return includeCheck;
+    }
+    return false;
+  });
 }
 
 function formatExecutionEvidence(command: string, result: ExecResult): string {
