@@ -6,6 +6,18 @@ export interface AppCredentials {
   readonly installationId: number;
 }
 
+export type GitHubPermissionLevel = "read" | "write";
+
+export interface InstallationTokenScope {
+  /**
+   * トークンのアクセス対象を限定するリポジトリ名（`owner/` を含めないリポジトリ名のみ）。
+   * GitHub REST API (`POST /app/installations/{installation_id}/access_tokens`) の仕様に従う。
+   */
+  readonly repositories?: readonly string[];
+  /** トークンに付与する権限の絞り込み（例: `{ contents: "read" }`）。 */
+  readonly permissions?: Readonly<Record<string, GitHubPermissionLevel>>;
+}
+
 export interface PullRequestClientOptions {
   /** `owner/name` 形式。 */
   readonly repository: string;
@@ -70,10 +82,15 @@ export async function createAppJwt(
 
 /**
  * installation access token を発行する。
- * 有効期限内（期限の 60 秒前まで）はキャッシュしたトークンを再利用する。
+ * `scope` を指定すると対象リポジトリ・権限を最小限に絞ったトークンを発行し、
+ * スコープ単位でキャッシュを分離する。有効期限内（期限の 60 秒前まで）はキャッシュを再利用する。
  */
-export async function issueInstallationToken(credentials: AppCredentials): Promise<string> {
-  const cacheKey = `${credentials.appId}:${credentials.installationId}`;
+export async function issueInstallationToken(
+  credentials: AppCredentials,
+  scope?: InstallationTokenScope,
+): Promise<string> {
+  const normalizedScope = normalizeTokenScope(scope);
+  const cacheKey = buildTokenCacheKey(credentials, normalizedScope);
   const now = Date.now();
   const cached = tokenCache.get(cacheKey);
   if (cached && cached.expiresAt - TOKEN_EXPIRY_MARGIN_MS > now) {
@@ -81,21 +98,29 @@ export async function issueInstallationToken(credentials: AppCredentials): Promi
   }
 
   const jwt = await createAppJwt(credentials.appId, credentials.privateKey, now);
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${jwt}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    "User-Agent": USER_AGENT,
+  };
+  let body: string | undefined;
+  if (normalizedScope !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(normalizedScope);
+  }
+
   const response = await fetch(
     `${GITHUB_API_BASE}/app/installations/${credentials.installationId}/access_tokens`,
     {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${jwt}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": GITHUB_API_VERSION,
-        "User-Agent": USER_AGENT,
-      },
+      headers,
+      ...(body !== undefined ? { body } : {}),
     },
   );
   if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`failed to issue installation token (${response.status}): ${body}`);
+    const errorBody = await response.text().catch(() => "");
+    throw new Error(`failed to issue installation token (${response.status}): ${errorBody}`);
   }
 
   const data = (await response.json()) as { token?: unknown; expires_at?: unknown };
@@ -107,6 +132,74 @@ export async function issueInstallationToken(credentials: AppCredentials): Promi
     tokenCache.set(cacheKey, { token: data.token, expiresAt });
   }
   return data.token;
+}
+
+interface NormalizedTokenScope {
+  readonly repositories?: readonly string[];
+  readonly permissions?: Readonly<Record<string, GitHubPermissionLevel>>;
+}
+
+const SAFE_REPOSITORY_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+
+function normalizeTokenScope(
+  scope: InstallationTokenScope | undefined,
+): NormalizedTokenScope | undefined {
+  if (!scope) {
+    return undefined;
+  }
+
+  let repositories: string[] | undefined;
+  if (scope.repositories !== undefined) {
+    if (scope.repositories.length === 0) {
+      throw new Error("installation token repositories scope must not be empty");
+    }
+    const unique = new Set<string>();
+    for (const raw of scope.repositories) {
+      const repo = raw.trim();
+      if (!SAFE_REPOSITORY_NAME_PATTERN.test(repo) || repo.includes("..")) {
+        throw new Error(
+          `invalid repository name for installation token scope (expected repo name without owner): "${raw}"`,
+        );
+      }
+      unique.add(repo);
+    }
+    repositories = [...unique].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  }
+
+  let permissions: Record<string, GitHubPermissionLevel> | undefined;
+  if (scope.permissions !== undefined) {
+    const entries = Object.entries(scope.permissions).sort(([a], [b]) =>
+      a < b ? -1 : a > b ? 1 : 0,
+    );
+    if (entries.length === 0) {
+      throw new Error("installation token permissions scope must not be empty");
+    }
+    for (const [key, level] of entries) {
+      if (key.trim().length === 0 || (level !== "read" && level !== "write")) {
+        throw new Error(`invalid installation token permission: "${key}" = "${String(level)}"`);
+      }
+    }
+    permissions = Object.fromEntries(entries);
+  }
+
+  if (repositories === undefined && permissions === undefined) {
+    return undefined;
+  }
+  return {
+    ...(repositories !== undefined ? { repositories } : {}),
+    ...(permissions !== undefined ? { permissions } : {}),
+  };
+}
+
+function buildTokenCacheKey(
+  credentials: AppCredentials,
+  scope: NormalizedTokenScope | undefined,
+): string {
+  const base = `${credentials.appId}:${credentials.installationId}`;
+  if (!scope) {
+    return base;
+  }
+  return `${base}:${JSON.stringify(scope)}`;
 }
 
 /**
