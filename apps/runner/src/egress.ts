@@ -93,9 +93,20 @@ export interface OutboundExecutionContext {
 export const CHECKOUT_ALLOWED_HOST = "github.com";
 
 export const DEFAULT_INSTALL_ALLOWED_HOSTS: readonly string[] = [
+  // Node.js (npm / pnpm / yarn)
   "registry.npmjs.org",
   "registry.yarnpkg.com",
   "repo.yarnpkg.com",
+  // Python (PyPI / uv)
+  "pypi.org",
+  "files.pythonhosted.org",
+  // Go (Go Module Proxy / Checksum DB)
+  "proxy.golang.org",
+  "sum.golang.org",
+  // Rust (crates.io sparse index & crate tarballs)
+  "index.crates.io",
+  "static.crates.io",
+  "crates.io",
 ];
 
 /** checkout 一時許可の既定 TTL（2 分）。 */

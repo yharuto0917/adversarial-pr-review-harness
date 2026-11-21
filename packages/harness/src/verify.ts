@@ -1,5 +1,5 @@
-import { detectNodeProject } from "./node-project.js";
 import type { ExecResult, SandboxPort } from "./ports.js";
+import { inspectProject } from "./project.js";
 
 export type ClaimExpectation = "passed" | "reproduced";
 
@@ -23,7 +23,7 @@ const MAX_EVIDENCE_OUTPUT_LENGTH = 500;
 const SHELL_META_CHARS = /[;&|`$><\r\n\\]/;
 
 const SAFE_COMMAND_PATTERN =
-  /^(?:(?:(?:corepack\s+)?(?:pnpm|yarn|npm)(?:@[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)?\s+(?:test|run\s+[A-Za-z0-9_.:-]+)|(?:npx|pnpx|bunx)\s+(?:vitest|jest|mocha|ava|tsc)|(?:vitest|jest|mocha|pytest|cargo\s+test|go\s+test|bun\s+test|deno\s+test))(?:\s+[A-Za-z0-9_./:@=-]+)*|(?:(?:npx|pnpx|bunx)\s+tsx|node)(?:\s+[A-Za-z0-9_./:@=-]+)+)$/;
+  /^(?:(?:(?:corepack\s+)?(?:pnpm|yarn|npm)(?:@[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)?\s+(?:test|run\s+[A-Za-z0-9_.:-]+)|(?:npx|pnpx|bunx)\s+(?:vitest|jest|mocha|ava|tsc)|uv\s+run(?:\s+(?:--offline|--no-sync))*\s+(?:pytest|python3?\s+-m\s+(?:pytest|unittest)|ruff\s+check|mypy)|\.venv\/bin\/(?:pytest|python3?\s+-m\s+(?:pytest|unittest)|ruff\s+check|mypy)|python3?\s+-m\s+(?:pytest|unittest)|ruff\s+check|mypy|(?:vitest|jest|mocha|pytest|cargo\s+(?:test|clippy)|go\s+(?:test|vet)|bun\s+test|deno\s+test))(?:\s+[A-Za-z0-9_./:@=-]+)*|(?:(?:npx|pnpx|bunx)\s+tsx|node)(?:\s+[A-Za-z0-9_./:@=-]+)+)$/;
 
 const PASSED_PATTERNS: readonly RegExp[] = [
   /テスト(?:が|は|も)?(?:すべて|全て|全部)?(?:通った|通りました|(?:通過|成功|パス)(?:した|しました|している|しています|を確認))/,
@@ -56,8 +56,9 @@ const NEGATED_REPRODUCED_PATTERN =
 const NEGATED_PASSED_PATTERN =
   /通らなかった|通らない|(?:通過|成功|パス)(?:しなかった|しない|しません|せず)|\btests?\s+did\s+not\s+(?:pass|succeed)\b/i;
 
-const TYPECHECK_MENTION_PATTERN = /type-?check|\btsc\b|型チェック|型検査/i;
-const LINT_MENTION_PATTERN = /\blint(?:ing)?\b|\beslint\b|\bbiome\s+lint\b|リント/i;
+const TYPECHECK_MENTION_PATTERN = /type-?check|\btsc\b|\bmypy\b|型チェック|型検査/i;
+const LINT_MENTION_PATTERN =
+  /\blint(?:ing)?\b|\beslint\b|\bbiome\s+lint\b|\bruff\b|\bclippy\b|\bgo\s+vet\b|リント/i;
 const CHECK_MENTION_PATTERN = /\bcheck(?::ci)?\b|\bbiome\s+check\b/i;
 
 /**
@@ -278,11 +279,8 @@ async function resolveVerificationCommands(
   }
 
   try {
-    const rootFiles = await sandbox.listFiles(".");
-    const normalizedFiles = rootFiles.map((file) => file.replace(/^\.\//, ""));
-    if (normalizedFiles.includes("package.json")) {
-      const packageJsonContent = await sandbox.readFile("package.json");
-      const project = detectNodeProject(packageJsonContent, normalizedFiles);
+    const project = await inspectProject(sandbox);
+    if (project.detected) {
       const selectedCommands = filterProjectVerificationCommands(project.testCommands, claim);
       if (selectedCommands.length > 0) {
         return { ok: true, commands: selectedCommands };
@@ -311,13 +309,29 @@ function filterProjectVerificationCommands(
   const includeCheck = CHECK_MENTION_PATTERN.test(claim);
 
   return testCommands.filter((command) => {
-    if (command.endsWith(" test") || /\srun\s+test:/.test(command)) {
+    if (
+      command.endsWith(" test") ||
+      /\srun\s+test:/.test(command) ||
+      /\bpytest\b/.test(command) ||
+      /\bpython3?\s+-m\s+unittest\b/.test(command) ||
+      command.startsWith("go test") ||
+      command.startsWith("cargo test")
+    ) {
       return true;
     }
-    if (command.endsWith(" run typecheck") || command.endsWith(" run type-check")) {
+    if (
+      command.endsWith(" run typecheck") ||
+      command.endsWith(" run type-check") ||
+      /\bmypy\b/.test(command)
+    ) {
       return includeTypecheck;
     }
-    if (command.endsWith(" run lint")) {
+    if (
+      command.endsWith(" run lint") ||
+      /\bruff\b/.test(command) ||
+      command.startsWith("go vet") ||
+      command.startsWith("cargo clippy")
+    ) {
       return includeLint;
     }
     if (command.endsWith(" run check") || command.endsWith(" run check:ci")) {
