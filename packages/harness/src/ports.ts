@@ -14,6 +14,30 @@ export interface ExecResult {
   readonly exitCode: number;
 }
 
+/**
+ * サンドボックスの単一コマンド実行に適用する外向き通信ポリシー。
+ * LLM ツール向けの `SandboxPort` からは指定できず、`SandboxService` 境界でのみ扱う。
+ */
+export type SandboxEgressPolicy =
+  | { readonly profile: "locked" }
+  | {
+      readonly profile: "checkout";
+      /** `owner/name` 形式。 */
+      readonly repository: string;
+      /**
+       * Worker 側（ContainerProxy）でオンメモリ注入する一時的な GitHub installation token。
+       * コンテナのコマンド引数・環境変数・DO 永続ストレージには残さない。
+       */
+      readonly githubToken?: string;
+      /** true の場合、チェックアウト実行前に既存コンテナを破棄してクリーンな状態から開始する。 */
+      readonly resetContainer?: boolean;
+    }
+  | { readonly profile: "install" };
+
+export interface SandboxExecOptions {
+  readonly egress?: SandboxEgressPolicy;
+}
+
 /** サンドボックス（fs / shell）への出口。 */
 export interface SandboxPort {
   exec(command: string): Promise<ExecResult>;
@@ -27,7 +51,7 @@ export interface SandboxPort {
  * runner が RPC で公開し、orchestrator が sandboxId を固定して SandboxPort に束ねる。
  */
 export interface SandboxService {
-  exec(sandboxId: string, command: string): Promise<ExecResult>;
+  exec(sandboxId: string, command: string, options?: SandboxExecOptions): Promise<ExecResult>;
   readFile(sandboxId: string, path: string): Promise<string>;
   writeFile(sandboxId: string, path: string, content: string): Promise<void>;
   listFiles(sandboxId: string, path: string): Promise<string[]>;
@@ -59,9 +83,16 @@ export interface HarnessPorts {
 }
 
 /** sandboxId を固定して SandboxService を SandboxPort として扱う。 */
-export function bindSandbox(service: SandboxService, sandboxId: string): SandboxPort {
+export function bindSandbox(
+  service: SandboxService,
+  sandboxId: string,
+  defaultExecOptions?: SandboxExecOptions,
+): SandboxPort {
   return {
-    exec: (command) => service.exec(sandboxId, command),
+    exec: (command) =>
+      defaultExecOptions === undefined
+        ? service.exec(sandboxId, command)
+        : service.exec(sandboxId, command, defaultExecOptions),
     readFile: (path) => service.readFile(sandboxId, path),
     writeFile: (path, content) => service.writeFile(sandboxId, path, content),
     listFiles: (path) => service.listFiles(sandboxId, path),

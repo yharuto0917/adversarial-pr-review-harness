@@ -170,6 +170,89 @@ describe("createAppJwt / issueInstallationToken", () => {
     expect(second).toBe("ghs_token_2");
     expect(count).toBe(2);
   });
+
+  it("repositories と permissions を指定すると JSON ボディで最小権限トークンを発行し、スコープ別にキャッシュを分離する", async () => {
+    const calls: Array<{ body: string | undefined; contentType: string | undefined }> = [];
+    const futureIso = new Date(Date.now() + 3600_000).toISOString();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        const headers = new Headers(init?.headers);
+        calls.push({
+          body: typeof init?.body === "string" ? init.body : undefined,
+          contentType: headers.get("Content-Type") ?? undefined,
+        });
+        return Response.json(
+          { token: `ghs_scoped_${calls.length}`, expires_at: futureIso },
+          { status: 201 },
+        );
+      }),
+    );
+
+    const credentials = { appId: "12345", privateKey: pkcs1Pem, installationId: 222 };
+    const defaultToken = await issueInstallationToken(credentials);
+    const readOnlyToken = await issueInstallationToken(credentials, {
+      repositories: ["repo"],
+      permissions: { contents: "read" },
+    });
+    const readOnlyCached = await issueInstallationToken(credentials, {
+      repositories: [" repo ", "repo"],
+      permissions: { contents: "read" },
+    });
+    const otherRepoToken = await issueInstallationToken(credentials, {
+      repositories: ["other"],
+      permissions: { contents: "read" },
+    });
+    const writeToken = await issueInstallationToken(credentials, {
+      repositories: ["repo"],
+      permissions: { contents: "write" },
+    });
+
+    expect(defaultToken).toBe("ghs_scoped_1");
+    expect(readOnlyToken).toBe("ghs_scoped_2");
+    expect(readOnlyCached).toBe("ghs_scoped_2");
+    expect(otherRepoToken).toBe("ghs_scoped_3");
+    expect(writeToken).toBe("ghs_scoped_4");
+    expect(calls).toEqual([
+      { body: undefined, contentType: undefined },
+      {
+        body: JSON.stringify({ repositories: ["repo"], permissions: { contents: "read" } }),
+        contentType: "application/json",
+      },
+      {
+        body: JSON.stringify({ repositories: ["other"], permissions: { contents: "read" } }),
+        contentType: "application/json",
+      },
+      {
+        body: JSON.stringify({ repositories: ["repo"], permissions: { contents: "write" } }),
+        contentType: "application/json",
+      },
+    ]);
+  });
+
+  it("repositories や permissions に不正な値を渡すと例外を投げる", async () => {
+    const credentials = { appId: "12345", privateKey: pkcs1Pem, installationId: 333 };
+    await expect(
+      issueInstallationToken(credentials, { repositories: ["octo/repo"] }),
+    ).rejects.toThrow(/invalid repository name/);
+    await expect(issueInstallationToken(credentials, { repositories: ["."] })).rejects.toThrow(
+      /invalid repository name/,
+    );
+    await expect(
+      issueInstallationToken(credentials, { repositories: ["foo bar"] }),
+    ).rejects.toThrow(/invalid repository name/);
+    await expect(issueInstallationToken(credentials, { repositories: [] })).rejects.toThrow(
+      /must not be empty/,
+    );
+    await expect(issueInstallationToken(credentials, { permissions: {} })).rejects.toThrow(
+      /must not be empty/,
+    );
+    await expect(
+      issueInstallationToken(credentials, {
+        permissions: { contents: "admin" as unknown as "read" },
+      }),
+    ).rejects.toThrow(/invalid installation token permission/);
+  });
 });
 
 describe("createPullRequestClient", () => {

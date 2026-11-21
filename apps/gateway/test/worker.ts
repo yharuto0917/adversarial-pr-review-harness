@@ -1,7 +1,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxProvider } from "@earendil-works/pi-ai/providers/faux";
-import type { ExecResult, SandboxService } from "@repo/harness";
+import type { ExecResult, SandboxExecOptions, SandboxService } from "@repo/harness";
 import { ReviewOrchestrator as ProductionOrchestrator } from "@repo/orchestrator";
 
 export { CredentialVault, default } from "../src/index.js";
@@ -12,6 +12,13 @@ export const faux = fauxProvider({ provider: "faux", models: [{ id: "faux-1" }] 
 
 /** サンドボックスに届いたコマンドの記録。 */
 export const executed: string[] = [];
+
+/** サンドボックスに届いた exec 呼び出し（コマンド + エグレス指定）の記録。 */
+export const executedCalls: Array<{
+  readonly sandboxId: string;
+  readonly command: string;
+  readonly options: SandboxExecOptions | undefined;
+}> = [];
 
 /** sandboxId ごとのインメモリファイルシステム。 */
 export const sandboxFiles = new Map<string, Map<string, string>>();
@@ -29,7 +36,7 @@ function filesOf(sandboxId: string): Map<string, string> {
 }
 
 const GIT_FETCH_PATTERN =
-  /git\s+-c\s+"http\.extraHeader=Authorization:\s+Basic\s+([^"]+)"\s+fetch\s+--depth\s+1\s+https:\/\/github\.com\/([^\s]+?)\.git\s+(?:--\s+)?([^\s&]+)/;
+  /GIT_TERMINAL_PROMPT=0\s+git\s+fetch\s+--depth\s+1\s+https:\/\/github\.com\/([^\s]+?)\.git\s+(?:--\s+)?([^\s&]+)/;
 
 const INSTALL_COMMAND_PATTERN =
   /^(?:corepack\s+(?:npm|pnpm|yarn)@[0-9A-Za-z.-]+\s+|(?:npm|pnpm|yarn)\s+)(?:ci|install(?: --frozen-lockfile)?)$/;
@@ -42,15 +49,26 @@ const TEST_COMMAND_PATTERN =
  * ReviewOrchestrator.ports() の sandbox は差し替えず、本番と同じく RUNNER への RPC を通す。
  */
 export class SandboxEntrypoint extends WorkerEntrypoint implements SandboxService {
-  async exec(sandboxId: string, command: string): Promise<ExecResult> {
+  async exec(
+    sandboxId: string,
+    command: string,
+    options?: SandboxExecOptions,
+  ): Promise<ExecResult> {
     executed.push(command);
+    executedCalls.push({ sandboxId, command, options });
     const fetchMatch = command.match(GIT_FETCH_PATTERN);
     if (fetchMatch) {
-      const [, basicAuth, repo, sha] = fetchMatch;
+      const [, repo, sha] = fetchMatch;
+      const checkoutToken =
+        options?.egress?.profile === "checkout" ? options.egress.githubToken : undefined;
+      if (options?.egress?.profile === "checkout" && options.egress.resetContainer) {
+        filesOf(sandboxId).clear();
+      }
       if (sha === "fail-sha") {
+        const leaked = checkoutToken ? btoa(`x-access-token:${checkoutToken}`) : "no-token";
         return {
           stdout: "fetch output",
-          stderr: `fatal: authentication failed (${basicAuth})`,
+          stderr: `fatal: authentication failed (${leaked})`,
           exitCode: 128,
         };
       }

@@ -222,8 +222,9 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
   /**
    * PR の head をサンドボックスのカレントディレクトリへチェックアウトし、
    * Node プロジェクトであればパッケージマネージャを検出して依存をインストールする。
-   * 同じ head が既にチェックアウト済みなら再利用し、更新されたら取り直す。
-   * installation token は一時 HTTP ヘッダとして渡し、環境変数や `.git/config` 等には残さない。
+   * 同じ head が既にチェックアウト済みなら再利用し、更新されたらコンテナを破棄して取り直す。
+   * 最小権限（対象リポジトリ・contents: read）の installation token は runner の ContainerProxy
+   * 側でオンメモリ注入し、コンテナ内のコマンド引数・環境変数・ファイルには一切渡さない。
    */
   async #checkoutHead(): Promise<readonly string[]> {
     this.#ensureSchema();
@@ -236,18 +237,26 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
       "UPDATE review_target SET checked_out_sha = NULL, test_commands_json = '[]' WHERE id = 1",
     );
 
-    const token = await this.#getInstallationToken(target.installationId);
+    const repoName = extractRepositoryName(target.repository);
+    const token = await this.#getCheckoutToken(target.installationId, repoName);
     const basicAuth = btoa(`x-access-token:${token}`);
     const repoUrl = `https://github.com/${target.repository}.git`;
     const command = [
       "git init -q",
-      `git -c "http.extraHeader=Authorization: Basic ${basicAuth}" fetch --depth 1 ${repoUrl} -- ${target.headSha}`,
+      `GIT_TERMINAL_PROMPT=0 git fetch --depth 1 ${repoUrl} -- ${target.headSha}`,
       "git checkout -q --force FETCH_HEAD",
       "git clean -fdx -q",
     ].join(" && ");
 
-    const sandbox = this.ports().sandbox;
-    const result = await sandbox.exec(command);
+    const sandboxId = this.ctx.id.toString();
+    const result = await this.env.RUNNER.exec(sandboxId, command, {
+      egress: {
+        profile: "checkout",
+        repository: target.repository,
+        githubToken: token,
+        resetContainer: true,
+      },
+    });
     if (result.exitCode !== 0) {
       const rawOutput = [result.stderr, result.stdout].filter(Boolean).join("\n");
       const detail = redactSecrets(rawOutput, [token, basicAuth]).trim();
@@ -256,7 +265,10 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
       );
     }
 
-    const project = await setupNodeProject(sandbox);
+    const installSandbox = bindSandbox(this.env.RUNNER, sandboxId, {
+      egress: { profile: "install" },
+    });
+    const project = await setupNodeProject(installSandbox);
 
     this.ctx.storage.sql.exec(
       "UPDATE review_target SET checked_out_sha = ?, test_commands_json = ? WHERE id = 1",
@@ -273,6 +285,20 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
       privateKey: this.env.GITHUB_APP_PRIVATE_KEY,
       installationId,
     });
+  }
+
+  #getCheckoutToken(installationId: number, repositoryName: string): Promise<string> {
+    return issueInstallationToken(
+      {
+        appId: this.env.GITHUB_APP_ID,
+        privateKey: this.env.GITHUB_APP_PRIVATE_KEY,
+        installationId,
+      },
+      {
+        repositories: [repositoryName],
+        permissions: { contents: "read" },
+      },
+    );
   }
 
   #saveTarget(request: ReviewRequest): void {
@@ -344,6 +370,14 @@ function parseStringArray(raw: string): string[] {
     return [];
   }
   return parsed.filter((item): item is string => typeof item === "string");
+}
+
+function extractRepositoryName(fullRepository: string): string {
+  const slashIndex = fullRepository.indexOf("/");
+  if (slashIndex === -1 || slashIndex === fullRepository.length - 1) {
+    throw new Error(`invalid repository: ${fullRepository}`);
+  }
+  return fullRepository.slice(slashIndex + 1);
 }
 
 function redactSecrets(input: string, secrets: readonly string[]): string {

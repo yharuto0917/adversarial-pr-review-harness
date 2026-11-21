@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   executed,
+  executedCalls,
   faux,
   type ProductionOrchestrator,
   remoteRepoFiles,
@@ -32,6 +33,7 @@ const request = {
 describe("ReviewOrchestrator", () => {
   beforeEach(() => {
     executed.length = 0;
+    executedCalls.length = 0;
     sandboxFiles.clear();
     remoteRepoFiles.clear();
     clearInstallationTokenCache();
@@ -146,11 +148,25 @@ describe("ReviewOrchestrator", () => {
     ]);
   });
 
-  it("start() で PR の head をチェックアウトし、read_file でファイルが読め、token を環境変数やファイルに残さない", async () => {
+  it("start() で最小権限トークン・checkout/install フェーズ・コンテナ再作成を用いて取得し、token をコマンド・環境変数・ファイルに残さない", async () => {
     remoteRepoFiles.set("octo/repo@abc123", {
       "src/sum.ts": "export const sum = (ns: number[]) => ns.reduce((a, b) => a + b);\n",
       "package.json": '{"name":"octo-repo"}\n',
     });
+    const tokenRequests: Array<string | undefined> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/app/installations/42/access_tokens")) {
+          tokenRequests.push(typeof init?.body === "string" ? init.body : undefined);
+          const expiresAt = new Date(Date.now() + 3600_000).toISOString();
+          return Response.json({ token: "ghs_inst_42", expires_at: expiresAt }, { status: 201 });
+        }
+        return new Response("unexpected url", { status: 404 });
+      }),
+    );
+
     const toolResults: Array<{ toolName: string; isError: boolean; text: string }> = [];
     faux.setResponses([
       toolCall("read_file", { path: "src/sum.ts" }),
@@ -180,15 +196,33 @@ describe("ReviewOrchestrator", () => {
       },
     ]);
 
+    expect(tokenRequests).toEqual([
+      JSON.stringify({ repositories: ["repo"], permissions: { contents: "read" } }),
+    ]);
+
     expect(executed).toEqual([expect.any(String), "npm install"]);
     const checkoutCmd = executed[0] ?? "";
     const expectedBasicAuth = btoa("x-access-token:ghs_inst_42");
     expect(checkoutCmd).toContain(
-      `-c "http.extraHeader=Authorization: Basic ${expectedBasicAuth}"`,
+      "GIT_TERMINAL_PROMPT=0 git fetch --depth 1 https://github.com/octo/repo.git -- abc123",
     );
+    expect(checkoutCmd).not.toContain("http.extraHeader");
     expect(checkoutCmd).not.toContain("ghs_inst_42");
+    expect(checkoutCmd).not.toContain(expectedBasicAuth);
     expect(checkoutCmd).not.toContain("x-access-token:");
     expect(checkoutCmd).not.toMatch(/\bexport\b/);
+
+    expect(executedCalls[0]?.options).toEqual({
+      egress: {
+        profile: "checkout",
+        repository: "octo/repo",
+        githubToken: "ghs_inst_42",
+        resetContainer: true,
+      },
+    });
+    expect(executedCalls[1]?.options).toEqual({
+      egress: { profile: "install" },
+    });
 
     for (const files of sandboxFiles.values()) {
       for (const [path, content] of files.entries()) {
@@ -384,6 +418,11 @@ describe("ReviewOrchestrator", () => {
         expect.stringContaining(`https://github.com/octo/repo.git -- ${sha}`),
         expectedInstall,
         testCmd,
+      ]);
+      expect(executedCalls.map((call) => call.options?.egress?.profile)).toEqual([
+        "checkout",
+        "install",
+        undefined,
       ]);
       expect(userPrompts[0]).toContain(expectedHint);
       expect(execOutputs).toEqual([
@@ -649,13 +688,24 @@ describe("ReviewOrchestrator", () => {
       expect(r.text).not.toContain("ghs_secret_token_99");
     }
 
-    // 1 回目の installation token 発行 + 3 つの GitHub API 呼び出し（キャッシュ再利用で計 4 回）
-    expect(githubCalls).toHaveLength(4);
-    expect(githubCalls[0]?.url).toBe("https://api.github.com/app/installations/99/access_tokens");
-    expect(githubCalls[0]?.method).toBe("POST");
+    // チェックアウト用（最小権限: repo + contents: read）と PR 操作用でトークン発行が分離され、
+    // PR 操作 3 回は 2 つ目のトークンをキャッシュ再利用する（計 5 回）
+    expect(githubCalls).toHaveLength(5);
+    expect(githubCalls[0]).toMatchObject({
+      url: "https://api.github.com/app/installations/99/access_tokens",
+      method: "POST",
+      body: JSON.stringify({ repositories: ["repo"], permissions: { contents: "read" } }),
+    });
     expect(githubCalls[0]?.auth).toMatch(/^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
 
-    expect(githubCalls.slice(1)).toEqual([
+    expect(githubCalls[1]).toMatchObject({
+      url: "https://api.github.com/app/installations/99/access_tokens",
+      method: "POST",
+      body: undefined,
+    });
+    expect(githubCalls[1]?.auth).toMatch(/^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+
+    expect(githubCalls.slice(2)).toEqual([
       {
         url: "https://api.github.com/repos/octo/repo/pulls/5",
         method: "GET",

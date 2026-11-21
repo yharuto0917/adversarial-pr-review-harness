@@ -10,8 +10,8 @@ catalogs:
       specifier: ^2.5.12
       version: 2.5.12
     '@cloudflare/sandbox':
-      specifier: ^0.12.9
-      version: 0.12.9
+      specifier: 0.12.14
+      version: 0.12.14
     '@cloudflare/vitest-plugin':
       specifier: ^1.1.6
       version: 1.1.6
@@ -168,7 +168,7 @@ importers:
     dependencies:
       '@cloudflare/sandbox':
         specifier: 'catalog:'
-        version: 0.12.9
+        version: 0.12.14
       '@repo/harness':
         specifier: workspace:*
         version: link:../../packages/harness
@@ -766,8 +766,8 @@ packages:
     resolution: {integrity: sha512-jxQYkj8dSIzc0cD6cMMNdOc1UVjqSqu8BZdor5s8cGjW2I8BjODt/kWPVdY+u9zj3ms75Q5qaZgnxUad83+eAg==}
     engines: {node: '>=22.0.0'}
 
-  '@cloudflare/sandbox@0.12.9':
-    resolution: {integrity: sha512-JlCQ8adVaHT3TrZO13X6US2LJTyQ4YvoEZpfh5EewRqcxPfMHZNJPB/1dsRdiFqmtzpz+lMxGazSUa2H/g2IKg==}
+  '@cloudflare/sandbox@0.12.14':
+    resolution: {integrity: sha512-Y+QaTgYtK3tfu2mz7q3Egn9Yzo1gFlmM5/+0tqHaXuXZBuPfEETQ1Dj4UeL/KWd+2KFefUlBdrLL6/uAMRUj9g==}
     peerDependencies:
       '@openai/agents': ^0.3.3
       '@opencode-ai/sdk': ^1.1.40
@@ -4469,7 +4469,7 @@ snapshots:
 
   '@cloudflare/kv-asset-handler@0.5.0': {}
 
-  '@cloudflare/sandbox@0.12.9':
+  '@cloudflare/sandbox@0.12.14':
     dependencies:
       '@cloudflare/containers': 0.3.7
       aws4fetch: 1.0.20

@@ -5,6 +5,8 @@
   "compatibility_date": "2026-09-08",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+  // install フェーズで既定レジストリ以外に追加許可する公開 FQDN が必要な場合は、
+  // 環境変数 SANDBOX_EXTRA_ALLOWED_HOSTS（カンマ区切り）を設定する。
   "containers": [
     {
       "class_name": "ReviewSandbox",
