@@ -9,11 +9,12 @@ import {
   type GitHubPort,
   type HarnessPorts,
   parseModelRef,
+  type SandboxPort,
   type SandboxService,
   setupNodeProject,
 } from "@repo/harness";
 import { PiHarness, type PiOperationResult, type PiReceipt } from "agents/harness/pi";
-import { Lifecycle } from "agents/lifecycle";
+import { Lifecycle, type LifecycleJobContext, type LifecycleJobOutcome } from "agents/lifecycle";
 
 import { type CredentialVault, VAULT_INSTANCE_NAME } from "./credential-vault.js";
 import { type RecordedFinding, SqlFindingsStore } from "./findings-store.js";
@@ -21,6 +22,22 @@ import { vaultCredentials } from "./vault-credentials.js";
 
 /** `REVIEW_MODEL` が未設定のときに使うモデル。 */
 export const DEFAULT_REVIEW_MODEL = "openai/gpt-6-sol";
+
+/** サンドボックスの最大生存時間（既定 30 分）。異常終了やハングでもこの時間で強制破棄する。 */
+export const DEFAULT_SANDBOX_MAX_LIFETIME_MS = 30 * 60 * 1_000;
+
+/** DO 退避などで完了監視が失われた場合にアイドル破棄を救済するポーリング間隔（既定 60 秒）。 */
+export const DEFAULT_SANDBOX_CLEANUP_POLL_MS = 60 * 1_000;
+
+/** 破棄 RPC の待機上限（既定 30 秒）。制御プレーン無応答時に次回チェックアウトを止めないための上限。 */
+export const DEFAULT_SANDBOX_DESTROY_TIMEOUT_MS = 30_000;
+
+const SANDBOX_CLEANUP_JOB_ID = "sandbox-cleanup";
+const SANDBOX_CLEANUP_JOB_FN = "cleanupSandbox";
+const SANDBOX_CLEANUP_HUNG_TIMEOUT_SECONDS = 120;
+const DEFAULT_DESTROY_RETRY_BASE_DELAY_MS = 30_000;
+const DESTROY_MAX_RETRIES = 5;
+const ABORT_WAIT_TIMEOUT_MS = 10_000;
 
 export interface OrchestratorEnv {
   readonly VAULT: DurableObjectNamespace<CredentialVault>;
@@ -53,7 +70,22 @@ interface ReviewTarget {
   readonly installationId: number;
   readonly checkedOutSha: string | null;
   readonly testCommands: readonly string[];
+  readonly sandboxActive: boolean;
+  readonly sandboxGeneration: number;
+  readonly sandboxExpiresAt: number | null;
 }
+
+interface CleanupJobPayload {
+  readonly generation: number;
+  readonly pendingDestroy?: boolean;
+  readonly retryCount?: number;
+}
+
+type SandboxDestroyReason =
+  | "review_completed"
+  | "setup_failed"
+  | "ttl_expired"
+  | "idle_after_recovery";
 
 interface InflightSetup {
   readonly key: string;
@@ -73,7 +105,11 @@ const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
   readonly #findings = new SqlFindingsStore(this.ctx.storage.sql);
   readonly #registry = createRegistry();
+  readonly #inflightStarts = new Map<string, Promise<PiReceipt>>();
+  #admittingStarts = 0;
   #inflightSetup: InflightSetup | null = null;
+  #inflightIdleCheck: Promise<void> | null = null;
+  #inflightCleanup: Promise<void> | null = null;
 
   readonly harness = new PiHarness({
     harness: ({ storage, context }) => {
@@ -102,20 +138,179 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
     if (!SAFE_REF.test(request.headSha) || request.headSha.includes("..")) {
       throw new Error(`invalid headSha: ${request.headSha}`);
     }
-    const testCommands = await this.#prepareTarget(request);
-    return this.harness.submit(buildReviewPrompt(request, testCommands), {
-      operationId: request.deliveryId,
-    });
+    this.#ensureSchema();
+
+    // すでに受理済みの deliveryId の再送では、サンドボックスを再起動せずに重複結果を返す
+    if (this.#hasDelivery(request.deliveryId)) {
+      return this.harness.submit("", { operationId: request.deliveryId });
+    }
+
+    // 同じ deliveryId がセットアップ中に並行到着した場合は先行処理の完了を待ってから判定する
+    while (true) {
+      const existingInflight = this.#inflightStarts.get(request.deliveryId);
+      if (!existingInflight) {
+        break;
+      }
+      try {
+        await existingInflight;
+      } catch {
+        // 先行するセットアップ失敗時は後続リクエストで再試行する
+      }
+      if (this.#hasDelivery(request.deliveryId)) {
+        return this.harness.submit("", { operationId: request.deliveryId });
+      }
+    }
+
+    this.#admittingStarts += 1;
+    const startPromise = (async (): Promise<PiReceipt> => {
+      let setupFailed = false;
+      try {
+        let testCommands: readonly string[];
+        try {
+          testCommands = await this.#prepareTarget(request);
+        } catch (error) {
+          setupFailed = true;
+          throw error;
+        }
+        const receipt = await this.harness.submit(buildReviewPrompt(request, testCommands), {
+          operationId: request.deliveryId,
+        });
+        this.#recordDelivery(request.deliveryId);
+        if (receipt.accepted) {
+          this.#watchOperationCompletion(receipt.operationId);
+        } else {
+          this.ctx.waitUntil(this.#cleanupSandboxIfIdle());
+        }
+        return receipt;
+      } finally {
+        this.#admittingStarts -= 1;
+        // 共有 #inflightSetup を含め全ての並行 start() が受付を終えた時点で、
+        // 他に進行中レビューが無ければ失敗したセットアップのコンテナを即座に破棄する。
+        // 元のセットアップエラーを失わないよう後片付けの二次例外はすべて捕捉してログに留める。
+        if (setupFailed && this.#admittingStarts === 0 && this.#inflightSetup === null) {
+          try {
+            const pending = await this.harness.pending().catch(() => null);
+            if (pending !== null && pending.length === 0 && this.#admittingStarts === 0) {
+              await this.#destroySandbox("setup_failed", { swallowErrors: true });
+            }
+          } catch (cleanupError) {
+            console.error({
+              event: "orchestrator.sandbox.cleanup_error",
+              sandboxId: this.ctx.id.toString(),
+              reason: "setup_failed",
+              error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+            });
+          }
+        }
+      }
+    })();
+
+    this.#inflightStarts.set(request.deliveryId, startPromise);
+    const clearInflightStart = () => {
+      if (this.#inflightStarts.get(request.deliveryId) === startPromise) {
+        this.#inflightStarts.delete(request.deliveryId);
+      }
+    };
+    startPromise.then(clearInflightStart, clearInflightStart);
+    return startPromise;
   }
 
-  /** レビュー実行の完了を待ち、結果を返す。 */
+  /** レビュー実行の完了を待ち、後片付けを反映したうえで結果を返す。 */
   async result(deliveryId: string): Promise<PiOperationResult> {
-    return this.harness.wait(deliveryId);
+    const outcome = await this.harness.wait(deliveryId);
+    await this.#cleanupSandboxIfIdle();
+    return outcome;
   }
 
   /** あるレビュー実行で報告された指摘を返す。 */
   async findings(deliveryId: string): Promise<RecordedFinding[]> {
     return this.#findings.list(deliveryId);
+  }
+
+  /**
+   * Lifecycle が管理するホストジョブのディスパッチ入口。
+   * サンドボックスの最大生存時間（TTL）超過による強制破棄、DO 退避後のアイドル回収、
+   * および破棄 RPC 一時失敗時の指数バックオフ再試行を担う。
+   */
+  async onJob(context: LifecycleJobContext): Promise<LifecycleJobOutcome> {
+    if (context.job.fn !== SANDBOX_CLEANUP_JOB_FN) {
+      return;
+    }
+    try {
+      this.#ensureSchema();
+      const payload = parseCleanupJobPayload(context.job.payload);
+      const target = this.#getTarget();
+      if (!target) {
+        return;
+      }
+
+      if (payload !== null && target.sandboxGeneration !== payload.generation) {
+        return;
+      }
+
+      if (payload?.pendingDestroy) {
+        return await this.#retryPendingDestroy(payload.generation, payload.retryCount ?? 0);
+      }
+
+      if (!target.sandboxActive) {
+        return;
+      }
+
+      const now = Date.now();
+      if (target.sandboxExpiresAt !== null && now >= target.sandboxExpiresAt) {
+        await this.#destroySandbox("ttl_expired", {
+          expectedGeneration: target.sandboxGeneration,
+          forceAbort: true,
+          swallowErrors: true,
+        });
+        return;
+      }
+
+      if (this.#admittingStarts === 0 && this.#inflightSetup === null) {
+        const pending = await this.harness.pending();
+        if (pending.length === 0 && this.#admittingStarts === 0 && this.#inflightSetup === null) {
+          await this.#destroySandbox("idle_after_recovery", {
+            expectedGeneration: target.sandboxGeneration,
+            swallowErrors: true,
+          });
+          return;
+        }
+      }
+
+      const nextCheckAt =
+        target.sandboxExpiresAt !== null
+          ? Math.min(now + this.sandboxCleanupPollMs(), target.sandboxExpiresAt)
+          : now + this.sandboxCleanupPollMs();
+      return { rescheduleAt: nextCheckAt };
+    } catch (error) {
+      // Lifecycle のホスト onJob は未捕捉例外でジョブが消失するため、必ず捕捉して再スケジュールする
+      console.error({
+        event: "orchestrator.sandbox.cleanup_job_error",
+        sandboxId: this.ctx.id.toString(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { rescheduleAt: Date.now() + this.sandboxDestroyRetryBaseDelayMs() };
+    }
+  }
+
+  /** テストでサンドボックス最大生存時間を差し替えるための継ぎ目。 */
+  protected sandboxMaxLifetimeMs(): number {
+    return DEFAULT_SANDBOX_MAX_LIFETIME_MS;
+  }
+
+  /** テストでアイドル回収ポーリング間隔を差し替えるための継ぎ目。 */
+  protected sandboxCleanupPollMs(): number {
+    return DEFAULT_SANDBOX_CLEANUP_POLL_MS;
+  }
+
+  /** テストで破棄失敗時のリトライ基準待機時間を差し替えるための継ぎ目。 */
+  protected sandboxDestroyRetryBaseDelayMs(): number {
+    return DEFAULT_DESTROY_RETRY_BASE_DELAY_MS;
+  }
+
+  /** テストで破棄 RPC の待機上限を差し替えるための継ぎ目。 */
+  protected sandboxDestroyTimeoutMs(): number {
+    return DEFAULT_SANDBOX_DESTROY_TIMEOUT_MS;
   }
 
   /** テストで擬似モデルに差し替えるための継ぎ目。 */
@@ -129,8 +324,36 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
 
   /** テストで外部依存を差し替えるための継ぎ目。 */
   protected ports(): HarnessPorts {
+    const rawSandbox = bindSandbox(this.env.RUNNER, this.ctx.id.toString());
+    const assertSandboxUsable = () => {
+      const target = this.#getTarget();
+      if (!target?.sandboxActive) {
+        throw new Error("sandbox is no longer active; it has already been destroyed");
+      }
+      if (target.sandboxExpiresAt !== null && Date.now() >= target.sandboxExpiresAt) {
+        throw new Error("sandbox lifetime expired");
+      }
+    };
+    const sandbox: SandboxPort = {
+      exec: async (command, options) => {
+        assertSandboxUsable();
+        return rawSandbox.exec(command, options);
+      },
+      readFile: async (path) => {
+        assertSandboxUsable();
+        return rawSandbox.readFile(path);
+      },
+      writeFile: async (path, content) => {
+        assertSandboxUsable();
+        return rawSandbox.writeFile(path, content);
+      },
+      listFiles: async (path) => {
+        assertSandboxUsable();
+        return rawSandbox.listFiles(path);
+      },
+    };
     return {
-      sandbox: bindSandbox(this.env.RUNNER, this.ctx.id.toString()),
+      sandbox,
       github: this.#createGitHubPort(),
       findings: {
         report: async (finding) => {
@@ -168,7 +391,14 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
       head_sha TEXT NOT NULL,
       installation_id INTEGER NOT NULL,
       checked_out_sha TEXT,
-      test_commands_json TEXT NOT NULL DEFAULT '[]'
+      test_commands_json TEXT NOT NULL DEFAULT '[]',
+      sandbox_active INTEGER NOT NULL DEFAULT 0,
+      sandbox_generation INTEGER NOT NULL DEFAULT 0,
+      sandbox_expires_at INTEGER
+    )`);
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS review_deliveries (
+      delivery_id TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL
     )`);
     const columns = this.ctx.storage.sql
       .exec<{ name: string }>("PRAGMA table_info(review_target)")
@@ -178,6 +408,19 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
         "ALTER TABLE review_target ADD COLUMN test_commands_json TEXT NOT NULL DEFAULT '[]'",
       );
       this.ctx.storage.sql.exec("UPDATE review_target SET checked_out_sha = NULL WHERE id = 1");
+    }
+    if (!columns.some((col) => col.name === "sandbox_active")) {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE review_target ADD COLUMN sandbox_active INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (!columns.some((col) => col.name === "sandbox_generation")) {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE review_target ADD COLUMN sandbox_generation INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (!columns.some((col) => col.name === "sandbox_expires_at")) {
+      this.ctx.storage.sql.exec("ALTER TABLE review_target ADD COLUMN sandbox_expires_at INTEGER");
     }
   }
 
@@ -196,47 +439,77 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
     }
 
     const previous = this.#inflightSetup?.promise ?? Promise.resolve();
+    let current!: InflightSetup;
     const run = async (): Promise<readonly string[]> => {
       try {
-        await previous;
-      } catch {
-        // 先行する別 head のセットアップ失敗はそちらの呼び出し元に返っているため、後続のセットアップは続行する
+        try {
+          await previous;
+        } catch {
+          // 先行する別 head のセットアップ失敗はそちらの呼び出し元に返っているため、後続のセットアップは続行する
+        }
+        this.#ensureSchema();
+        this.#saveTarget(request);
+        return await this.#checkoutHead();
+      } finally {
+        // 呼び出し元の catch/finally が走る前に #inflightSetup を確実にクリアする
+        if (this.#inflightSetup === current) {
+          this.#inflightSetup = null;
+        }
       }
-      this.#ensureSchema();
-      this.#saveTarget(request);
-      return this.#checkoutHead();
     };
 
     const promise = run();
-    const current: InflightSetup = { key, promise };
+    current = { key, promise };
     this.#inflightSetup = current;
-    const clearInflight = () => {
-      if (this.#inflightSetup === current) {
-        this.#inflightSetup = null;
-      }
-    };
-    promise.then(clearInflight, clearInflight);
     return promise;
   }
 
   /**
    * PR の head をサンドボックスのカレントディレクトリへチェックアウトし、
    * Node プロジェクトであればパッケージマネージャを検出して依存をインストールする。
-   * 同じ head が既にチェックアウト済みなら再利用し、更新されたらコンテナを破棄して取り直す。
+   * アクティブな同一 head のサンドボックスが存在すれば再利用し、未作成・破棄済み・期限切れ・
+   * head 更新時はコンテナを破棄して取り直す。
    * 最小権限（対象リポジトリ・contents: read）の installation token は runner の ContainerProxy
    * 側でオンメモリ注入し、コンテナ内のコマンド引数・環境変数・ファイルには一切渡さない。
    */
   async #checkoutHead(): Promise<readonly string[]> {
+    // 進行中の後片付けが終わるまで上限時間付きで待ち、破棄ハングで次回開始が永久停止するのを防ぐ
+    if (this.#inflightCleanup) {
+      await waitWithTimeout(this.#inflightCleanup, this.sandboxDestroyTimeoutMs());
+    }
+
     this.#ensureSchema();
     const target = this.#requireTarget();
-    if (target.checkedOutSha === target.headSha) {
+    const now = Date.now();
+    if (
+      target.sandboxActive &&
+      target.checkedOutSha === target.headSha &&
+      target.sandboxExpiresAt !== null &&
+      now < target.sandboxExpiresAt
+    ) {
+      await this.#extendSandboxLifetime(target.sandboxGeneration);
       return target.testCommands;
     }
 
+    const generation = target.sandboxGeneration + 1;
+    const expiresAt = now + this.sandboxMaxLifetimeMs();
     this.ctx.storage.sql.exec(
-      "UPDATE review_target SET checked_out_sha = NULL, test_commands_json = '[]' WHERE id = 1",
+      `UPDATE review_target
+       SET checked_out_sha = NULL,
+           test_commands_json = '[]',
+           sandbox_active = 1,
+           sandbox_generation = ?,
+           sandbox_expires_at = ?
+       WHERE id = 1`,
+      generation,
+      expiresAt,
+    );
+    await this.#scheduleCleanupJob(
+      generation,
+      Math.min(now + this.sandboxCleanupPollMs(), expiresAt),
     );
 
+    const sandboxId = this.ctx.id.toString();
     const repoName = extractRepositoryName(target.repository);
     const token = await this.#getCheckoutToken(target.installationId, repoName);
     const basicAuth = btoa(`x-access-token:${token}`);
@@ -248,7 +521,6 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
       "git clean -fdx -q",
     ].join(" && ");
 
-    const sandboxId = this.ctx.id.toString();
     const result = await this.env.RUNNER.exec(sandboxId, command, {
       egress: {
         profile: "checkout",
@@ -257,11 +529,12 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
         resetContainer: true,
       },
     });
-    if (result.exitCode !== 0) {
+    if (result.timedOut || result.exitCode !== 0) {
       const rawOutput = [result.stderr, result.stdout].filter(Boolean).join("\n");
       const detail = redactSecrets(rawOutput, [token, basicAuth]).trim();
+      const verb = result.timedOut ? "timed out while checking out" : "failed to checkout";
       throw new Error(
-        `failed to checkout ${target.repository}@${target.headSha} (exit ${result.exitCode})${detail ? `: ${detail}` : ""}`,
+        `${verb} ${target.repository}@${target.headSha} (exit ${result.exitCode})${detail ? `: ${detail}` : ""}`,
       );
     }
 
@@ -270,13 +543,413 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
     });
     const project = await setupNodeProject(installSandbox);
 
+    const latest = this.#getTarget();
+    if (!latest?.sandboxActive || latest.sandboxGeneration !== generation) {
+      throw new Error("sandbox was destroyed while preparing target");
+    }
+
     this.ctx.storage.sql.exec(
-      "UPDATE review_target SET checked_out_sha = ?, test_commands_json = ? WHERE id = 1",
+      "UPDATE review_target SET checked_out_sha = ?, test_commands_json = ? WHERE id = 1 AND sandbox_generation = ?",
       target.headSha,
       JSON.stringify(project.testCommands),
+      generation,
     );
 
     return project.testCommands;
+  }
+
+  #watchOperationCompletion(operationId: string): void {
+    const work = (async () => {
+      try {
+        await this.harness.wait(operationId);
+      } catch {
+        // 待機中断時は永続クリーンアップジョブに委ねる
+      }
+      await this.#cleanupSandboxIfIdle();
+    })();
+    this.ctx.waitUntil(work);
+  }
+
+  async #cleanupSandboxIfIdle(): Promise<void> {
+    if (this.#inflightIdleCheck) {
+      return this.#inflightIdleCheck;
+    }
+    const run = async (): Promise<void> => {
+      try {
+        if (this.#inflightCleanup) {
+          await waitWithTimeout(this.#inflightCleanup, this.sandboxDestroyTimeoutMs());
+        }
+        const target = this.#getTarget();
+        if (!target?.sandboxActive) {
+          return;
+        }
+        // すでに現行世代の pendingDestroy バックオフ再試行が予約済みなら、上書き再実行せずジョブに委ねる
+        if (this.#hasPendingDestroyJob(target.sandboxGeneration)) {
+          return;
+        }
+        if (this.#admittingStarts > 0 || this.#inflightSetup !== null) {
+          return;
+        }
+        const pending = await this.harness.pending();
+        if (pending.length > 0) {
+          return;
+        }
+        if (this.#admittingStarts > 0 || this.#inflightSetup !== null) {
+          return;
+        }
+        const latest = this.#getTarget();
+        if (!latest?.sandboxActive || latest.sandboxGeneration !== target.sandboxGeneration) {
+          if (this.#inflightCleanup) {
+            await waitWithTimeout(this.#inflightCleanup, this.sandboxDestroyTimeoutMs());
+          }
+          return;
+        }
+        await this.#destroySandbox("review_completed", {
+          expectedGeneration: target.sandboxGeneration,
+          swallowErrors: true,
+        });
+      } catch (error) {
+        console.error({
+          event: "orchestrator.sandbox.cleanup_error",
+          sandboxId: this.ctx.id.toString(),
+          reason: "review_completed",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+
+    const check = run();
+    this.#inflightIdleCheck = check;
+    try {
+      await check;
+    } finally {
+      if (this.#inflightIdleCheck === check) {
+        this.#inflightIdleCheck = null;
+      }
+    }
+  }
+
+  async #extendSandboxLifetime(generation: number): Promise<void> {
+    const now = Date.now();
+    const expiresAt = now + this.sandboxMaxLifetimeMs();
+    this.ctx.storage.sql.exec(
+      "UPDATE review_target SET sandbox_expires_at = ? WHERE id = 1 AND sandbox_generation = ?",
+      expiresAt,
+      generation,
+    );
+    await this.#scheduleCleanupJob(
+      generation,
+      Math.min(now + this.sandboxCleanupPollMs(), expiresAt),
+    );
+  }
+
+  async #scheduleCleanupJob(
+    generation: number,
+    time: number,
+    extra?: { readonly pendingDestroy?: boolean; readonly retryCount?: number },
+  ): Promise<void> {
+    const payload: CleanupJobPayload = {
+      generation,
+      ...(extra?.pendingDestroy ? { pendingDestroy: true } : {}),
+      ...(extra?.retryCount !== undefined ? { retryCount: extra.retryCount } : {}),
+    };
+    await this.lifecycle.jobs.push({
+      id: SANDBOX_CLEANUP_JOB_ID,
+      fn: SANDBOX_CLEANUP_JOB_FN,
+      time,
+      payload,
+      singleflight: true,
+      hungTimeoutSeconds: SANDBOX_CLEANUP_HUNG_TIMEOUT_SECONDS,
+    });
+  }
+
+  async #destroySandbox(
+    reason: SandboxDestroyReason,
+    options: {
+      readonly expectedGeneration?: number;
+      readonly forceAbort?: boolean;
+      readonly swallowErrors?: boolean;
+    } = {},
+  ): Promise<{ readonly destroyed: boolean }> {
+    const previous = this.#inflightCleanup;
+    const run = async (): Promise<{ readonly destroyed: boolean }> => {
+      const sandboxId = this.ctx.id.toString();
+      try {
+        if (previous) {
+          await waitWithTimeout(previous, this.sandboxDestroyTimeoutMs());
+        }
+
+        const target = this.#getTarget();
+        if (!target?.sandboxActive) {
+          // 強制破棄（forceAbort）失敗直後は sandbox_active = 0 のまま現行世代の
+          // pendingDestroy 再試行ジョブが予約されているため、誤って解除しない
+          if (!target || !this.#hasPendingDestroyJob(target.sandboxGeneration)) {
+            await this.lifecycle.jobs.cancel(SANDBOX_CLEANUP_JOB_ID);
+          }
+          return { destroyed: false };
+        }
+        if (
+          options.expectedGeneration !== undefined &&
+          target.sandboxGeneration !== options.expectedGeneration
+        ) {
+          return { destroyed: false };
+        }
+        if (!options.forceAbort && this.#hasPendingDestroyJob(target.sandboxGeneration)) {
+          return { destroyed: false };
+        }
+
+        const nextGeneration = target.sandboxGeneration + 1;
+        if (options.forceAbort) {
+          // 強制破棄時は先に sandbox_active = 0・世代更新を確定させ、Pi によるゾンビ再生成を防ぐ
+          this.ctx.storage.sql.exec(
+            `UPDATE review_target
+             SET checked_out_sha = NULL,
+                 test_commands_json = '[]',
+                 sandbox_active = 0,
+                 sandbox_generation = ?,
+                 sandbox_expires_at = NULL
+             WHERE id = 1`,
+            nextGeneration,
+          );
+        } else {
+          this.ctx.storage.sql.exec(
+            `UPDATE review_target
+             SET checked_out_sha = NULL,
+                 test_commands_json = '[]',
+                 sandbox_generation = ?
+             WHERE id = 1`,
+            nextGeneration,
+          );
+        }
+
+        // RUNNER.destroy() 待機中に DO が退避・再起動・ハングした場合でも世代不一致で
+        // クリーンアップジョブが自己消滅しないよう、RPC 実行前に新世代の pendingDestroy を永続化する。
+        await this.#scheduleCleanupJob(
+          nextGeneration,
+          Date.now() + this.sandboxDestroyRetryBaseDelayMs(),
+          { pendingDestroy: true, retryCount: 0 },
+        );
+
+        // 強制破棄時は abort() を先に開始しつつ待たずに RUNNER.destroy() で実行中 RPC を切断し、
+        // デッドロックを回避してから上限時間付きで abort 完了を待つ
+        const abortPromise = options.forceAbort
+          ? this.harness.abort().catch((error: unknown) => {
+              console.error({
+                event: "orchestrator.sandbox.abort_error",
+                sandboxId,
+                reason,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            })
+          : null;
+
+        try {
+          await this.#destroyWithTimeout(sandboxId);
+        } catch (error) {
+          const retryCount = 1;
+          console.error({
+            event: "orchestrator.sandbox.destroy_failed",
+            sandboxId,
+            reason,
+            retryCount,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          const retryAt = Date.now() + this.sandboxDestroyRetryBaseDelayMs();
+          try {
+            await this.#scheduleCleanupJob(nextGeneration, retryAt, {
+              pendingDestroy: true,
+              retryCount,
+            });
+          } catch (scheduleError) {
+            console.error({
+              event: "orchestrator.sandbox.cleanup_error",
+              sandboxId,
+              reason,
+              error: scheduleError instanceof Error ? scheduleError.message : String(scheduleError),
+            });
+          }
+          if (abortPromise) {
+            await waitWithTimeout(abortPromise, ABORT_WAIT_TIMEOUT_MS);
+          }
+          if (options.swallowErrors) {
+            return { destroyed: false };
+          }
+          throw error;
+        }
+
+        this.ctx.storage.sql.exec(
+          "UPDATE review_target SET sandbox_active = 0, sandbox_expires_at = NULL WHERE id = 1 AND sandbox_generation = ?",
+          nextGeneration,
+        );
+        try {
+          await this.lifecycle.jobs.cancel(SANDBOX_CLEANUP_JOB_ID);
+        } catch (cancelError) {
+          // 破棄自体は完了済みのため、ジョブ解除の失敗はログに留め後続の onJob に委ねる
+          console.error({
+            event: "orchestrator.sandbox.cleanup_error",
+            sandboxId,
+            reason,
+            error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+          });
+        }
+        if (abortPromise) {
+          await waitWithTimeout(abortPromise, ABORT_WAIT_TIMEOUT_MS);
+        }
+        console.info({
+          event: "orchestrator.sandbox.destroyed",
+          sandboxId,
+          reason,
+        });
+        return { destroyed: true };
+      } catch (error) {
+        console.error({
+          event: "orchestrator.sandbox.cleanup_error",
+          sandboxId,
+          reason,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        if (options.swallowErrors) {
+          return { destroyed: false };
+        }
+        throw error;
+      }
+    };
+
+    const promise = run();
+    const tracked = promise.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#inflightCleanup = tracked;
+    void tracked.then(() => {
+      if (this.#inflightCleanup === tracked) {
+        this.#inflightCleanup = null;
+      }
+    });
+    return promise;
+  }
+
+  async #retryPendingDestroy(
+    expectedGeneration: number,
+    previousRetryCount: number,
+  ): Promise<LifecycleJobOutcome> {
+    const previous = this.#inflightCleanup;
+    const run = async (): Promise<LifecycleJobOutcome> => {
+      const sandboxId = this.ctx.id.toString();
+      try {
+        if (previous) {
+          await waitWithTimeout(previous, this.sandboxDestroyTimeoutMs());
+        }
+        const target = this.#getTarget();
+        if (!target || target.sandboxGeneration !== expectedGeneration) {
+          return;
+        }
+        try {
+          await this.#destroyWithTimeout(sandboxId);
+          this.ctx.storage.sql.exec(
+            "UPDATE review_target SET sandbox_active = 0, sandbox_expires_at = NULL WHERE id = 1 AND sandbox_generation = ?",
+            expectedGeneration,
+          );
+          console.info({
+            event: "orchestrator.sandbox.destroyed",
+            sandboxId,
+            reason: "retry_succeeded",
+          });
+          return;
+        } catch (error) {
+          const retryCount = previousRetryCount + 1;
+          console.error({
+            event: "orchestrator.sandbox.destroy_failed",
+            sandboxId,
+            reason: "retry",
+            retryCount,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          if (retryCount <= DESTROY_MAX_RETRIES) {
+            const backoffMs = this.sandboxDestroyRetryBaseDelayMs() * 2 ** (retryCount - 1);
+            await this.#scheduleCleanupJob(expectedGeneration, Date.now() + backoffMs, {
+              pendingDestroy: true,
+              retryCount,
+            });
+            return;
+          }
+          // 最大リトライ到達後は Runner 側 sleepAfter の自動停止に委ねる
+          this.ctx.storage.sql.exec(
+            "UPDATE review_target SET sandbox_active = 0, sandbox_expires_at = NULL WHERE id = 1 AND sandbox_generation = ?",
+            expectedGeneration,
+          );
+          return;
+        }
+      } catch (error) {
+        console.error({
+          event: "orchestrator.sandbox.cleanup_error",
+          sandboxId,
+          reason: "retry",
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return { rescheduleAt: Date.now() + this.sandboxDestroyRetryBaseDelayMs() };
+      }
+    };
+
+    const promise = run();
+    const tracked = promise.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#inflightCleanup = tracked;
+    void tracked.then(() => {
+      if (this.#inflightCleanup === tracked) {
+        this.#inflightCleanup = null;
+      }
+    });
+    return promise;
+  }
+
+  #hasPendingDestroyJob(generation: number): boolean {
+    const existingJob = this.lifecycle.jobs.get(SANDBOX_CLEANUP_JOB_ID);
+    const existingPayload = parseCleanupJobPayload(existingJob?.payload);
+    return existingPayload?.pendingDestroy === true && existingPayload.generation === generation;
+  }
+
+  async #destroyWithTimeout(sandboxId: string): Promise<void> {
+    const timeoutMs = this.sandboxDestroyTimeoutMs();
+    const destroyPromise = this.env.RUNNER.destroy(sandboxId);
+    // タイムアウト後に遅れて reject された場合の unhandled rejection を防ぐ
+    destroyPromise.catch(() => {});
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        destroyPromise,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`sandbox destroy RPC timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  #hasDelivery(deliveryId: string): boolean {
+    const row = this.ctx.storage.sql
+      .exec<{ delivery_id: string }>(
+        "SELECT delivery_id FROM review_deliveries WHERE delivery_id = ?",
+        deliveryId,
+      )
+      .toArray()[0];
+    return row !== undefined;
+  }
+
+  #recordDelivery(deliveryId: string): void {
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO review_deliveries (delivery_id, created_at) VALUES (?, ?)",
+      deliveryId,
+      Date.now(),
+    );
   }
 
   #getInstallationToken(installationId: number): Promise<string> {
@@ -320,7 +993,7 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
     );
   }
 
-  #requireTarget(): ReviewTarget {
+  #getTarget(): ReviewTarget | null {
     const row = this.ctx.storage.sql
       .exec<{
         repository: string;
@@ -329,12 +1002,17 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
         installation_id: number;
         checked_out_sha: string | null;
         test_commands_json: string;
+        sandbox_active: number;
+        sandbox_generation: number;
+        sandbox_expires_at: number | null;
       }>(
-        "SELECT repository, pull_number, head_sha, installation_id, checked_out_sha, test_commands_json FROM review_target WHERE id = 1",
+        `SELECT repository, pull_number, head_sha, installation_id, checked_out_sha,
+                test_commands_json, sandbox_active, sandbox_generation, sandbox_expires_at
+         FROM review_target WHERE id = 1`,
       )
       .toArray()[0];
     if (!row) {
-      throw new Error("review target is not initialized; call start() first");
+      return null;
     }
     return {
       repository: row.repository,
@@ -343,7 +1021,18 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
       installationId: row.installation_id,
       checkedOutSha: row.checked_out_sha,
       testCommands: parseStringArray(row.test_commands_json),
+      sandboxActive: row.sandbox_active === 1,
+      sandboxGeneration: row.sandbox_generation,
+      sandboxExpiresAt: row.sandbox_expires_at,
     };
+  }
+
+  #requireTarget(): ReviewTarget {
+    const target = this.#getTarget();
+    if (!target) {
+      throw new Error("review target is not initialized; call start() first");
+    }
+    return target;
   }
 
   /** いま実行中のレビュー。ツールは実行中のレビューからしか呼ばれない。 */
@@ -378,6 +1067,39 @@ function extractRepositoryName(fullRepository: string): string {
     throw new Error(`invalid repository: ${fullRepository}`);
   }
   return fullRepository.slice(slashIndex + 1);
+}
+
+function parseCleanupJobPayload(raw: unknown): CleanupJobPayload | null {
+  if (typeof raw !== "object" || raw === null) {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  if (typeof record.generation !== "number" || !Number.isInteger(record.generation)) {
+    return null;
+  }
+  return {
+    generation: record.generation,
+    ...(record.pendingDestroy === true ? { pendingDestroy: true } : {}),
+    ...(typeof record.retryCount === "number" && Number.isInteger(record.retryCount)
+      ? { retryCount: record.retryCount }
+      : {}),
+  };
+}
+
+async function waitWithTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      promise,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function redactSecrets(input: string, secrets: readonly string[]): string {

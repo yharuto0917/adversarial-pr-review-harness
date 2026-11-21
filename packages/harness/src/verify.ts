@@ -10,6 +10,8 @@ export interface VerifyCompletionOptions {
   readonly expectation?: ClaimExpectation;
   /** 出力（stdout / stderr）に含まれるべき文字列または正規表現。 */
   readonly expectedOutput?: string | RegExp;
+  /** 検証コマンド 1 件あたりの実行時間上限（ミリ秒）。Runner 側で上限クランプされる。 */
+  readonly timeoutMs?: number;
 }
 
 export interface VerificationResult {
@@ -174,23 +176,41 @@ export async function verifyCompletionClaim(
 
   const executions: Array<{ readonly command: string; readonly result: ExecResult }> = [];
   for (const command of resolved.commands) {
-    const result = await sandbox.exec(command);
+    let result: ExecResult;
+    try {
+      result =
+        options.timeoutMs === undefined
+          ? await sandbox.exec(command)
+          : await sandbox.exec(command, { timeoutMs: options.timeoutMs });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return {
+        passed: false,
+        evidence: [...evidence, `error: "${command}" failed to execute: ${reason}`],
+      };
+    }
     executions.push({ command, result });
     evidence.push(formatExecutionEvidence(command, result));
   }
 
   let passed = true;
 
+  const timedOutCommands = executions.filter(({ result }) => result.timedOut === true);
+  for (const { command } of timedOutCommands) {
+    passed = false;
+    evidence.push(`timeout: "${command}" exceeded the execution time limit`);
+  }
+
   if (expectation === "passed") {
     for (const { command, result } of executions) {
-      if (result.exitCode !== 0) {
+      if (!result.timedOut && result.exitCode !== 0) {
         passed = false;
         evidence.push(
           `mismatch: claim states tests passed, but "${command}" exited with code ${result.exitCode}`,
         );
       }
     }
-  } else {
+  } else if (timedOutCommands.length === 0) {
     const anyFailed = executions.some(({ result }) => result.exitCode !== 0);
     if (!anyFailed) {
       passed = false;
@@ -308,7 +328,8 @@ function filterProjectVerificationCommands(
 }
 
 function formatExecutionEvidence(command: string, result: ExecResult): string {
-  const parts = [`command: ${command} (exit code: ${result.exitCode})`];
+  const timeoutTag = result.timedOut ? " [timed out]" : "";
+  const parts = [`command: ${command} (exit code: ${result.exitCode})${timeoutTag}`];
   const stdout = truncateOutput(result.stdout.trim());
   const stderr = truncateOutput(result.stderr.trim());
   if (stdout.length > 0) {

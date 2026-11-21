@@ -18,6 +18,7 @@ const sandboxStub = {
   readFileGuarded: vi.fn(),
   writeFileGuarded: vi.fn(),
   listFilesGuarded: vi.fn(),
+  destroyGuarded: vi.fn(),
 };
 const getSandboxMock = vi.fn((..._args: unknown[]) => sandboxStub);
 
@@ -31,6 +32,7 @@ interface MockDoCtx {
 class MockSandboxBase {
   enableInternet = true;
   interceptHttps = false;
+  sleepAfter: string | number = "10m";
   usingInterception = false;
   applyOutboundInterceptionPromise: Promise<void> = Promise.resolve();
   appliedInterceptions: Array<{ method: string; params: unknown }> = [];
@@ -100,7 +102,21 @@ vi.mock("@cloudflare/sandbox", () => ({
   getSandbox: (...args: unknown[]) => getSandboxMock(...args),
 }));
 
-const { ContainerProxy, ReviewSandbox, SandboxEntrypoint } = await import("./index.js");
+const { ContainerProxy, ReviewSandbox, SANDBOX_SLEEP_AFTER, SandboxEntrypoint } = await import(
+  "./index.js"
+);
+const {
+  CHECKOUT_EXEC_DEFAULT_TIMEOUT_MS,
+  computeOuterTimeoutMs,
+  INSTALL_EXEC_DEFAULT_TIMEOUT_MS,
+  LOCKED_EXEC_DEFAULT_TIMEOUT_MS,
+  LOCKED_EXEC_MAX_TIMEOUT_MS,
+} = await import("./timeout.js");
+
+function extractInnerCommand(wrapped: string): string {
+  const match = wrapped.match(/bash -c '((?:[^']|'\\'')*)'/);
+  return match?.[1]?.replaceAll("'\\''", "'") ?? wrapped;
+}
 
 interface MockSandboxMethods {
   readonly exec: ReturnType<typeof vi.fn>;
@@ -170,6 +186,7 @@ describe("ReviewSandbox", () => {
 
     expect(instance.enableInternet).toBe(false);
     expect(instance.interceptHttps).toBe(true);
+    expect(instance.sleepAfter).toBe(SANDBOX_SLEEP_AFTER);
     expect(instance.usingInterception).toBe(true);
     expect(mocks.setOutboundHandler).toHaveBeenCalledTimes(1);
     expect(mocks.setOutboundHandler).toHaveBeenCalledWith("locked");
@@ -293,7 +310,8 @@ describe("ReviewSandbox", () => {
     mocks.setOutboundHandler.mockImplementation(async (method: string) => {
       timeline.push(`policy:${method}`);
     });
-    mocks.exec.mockImplementation(async (cmd: string) => {
+    mocks.exec.mockImplementation(async (wrappedCmd: string) => {
+      const cmd = extractInnerCommand(wrappedCmd);
       timeline.push(`exec:start:${cmd}`);
       if (cmd === "pnpm install") {
         await installGate;
@@ -484,8 +502,8 @@ describe("ReviewSandbox", () => {
     const installGate = new Promise<void>((resolve) => {
       releaseInstall = resolve;
     });
-    mocks.exec.mockImplementation(async (cmd: string) => {
-      if (cmd === "pnpm install") {
+    mocks.exec.mockImplementation(async (wrappedCmd: string) => {
+      if (extractInnerCommand(wrappedCmd) === "pnpm install") {
         await installGate;
       }
       return { stdout: "", stderr: "", exitCode: 0 };
@@ -500,7 +518,8 @@ describe("ReviewSandbox", () => {
       egress: { profile: "install" },
     });
     await vi.waitFor(() => {
-      expect(mocks.exec).toHaveBeenCalledWith("pnpm install");
+      expect(mocks.exec).toHaveBeenCalledTimes(1);
+      expect(extractInnerCommand(String(mocks.exec.mock.calls[0]?.[0]))).toBe("pnpm install");
     });
 
     const queuedLockedExec = instance.execWithEgress("curl https://registry.npmjs.org/vitest");
@@ -535,7 +554,8 @@ describe("ReviewSandbox", () => {
       releaseFirstExclusive = resolve;
     });
 
-    mocks.exec.mockImplementation(async (cmd: string) => {
+    mocks.exec.mockImplementation(async (wrappedCmd: string) => {
+      const cmd = extractInnerCommand(wrappedCmd);
       timeline.push(`start:${cmd}`);
       if (cmd === "locked-1") await firstLockedGate;
       if (cmd === "exclusive-1") await firstExclusiveGate;
@@ -572,6 +592,212 @@ describe("ReviewSandbox", () => {
       "end:locked-2",
     ]);
   });
+
+  it("プロファイル別にコマンドタイムアウトを強制し、ラップコマンドとコールドスタート余裕込みの SDK timeout を渡す", async () => {
+    const { instance, mocks, waitForInit } = createReviewSandbox();
+    await waitForInit();
+    mocks.exec.mockResolvedValue({ stdout: "ok", stderr: "", exitCode: 0 });
+
+    await instance.execWithEgress("pnpm test");
+    await instance.execWithEgress("pnpm test", { timeoutMs: 999_999 });
+    await instance.execWithEgress("git fetch", {
+      egress: { profile: "checkout", repository: "octo/repo" },
+    });
+    await instance.execWithEgress("pnpm install", { egress: { profile: "install" } });
+
+    expect(mocks.exec.mock.calls).toEqual([
+      [
+        expect.stringContaining("timeout --kill-after=5s 60s bash -c 'pnpm test'"),
+        { timeout: computeOuterTimeoutMs(LOCKED_EXEC_DEFAULT_TIMEOUT_MS) },
+      ],
+      [
+        expect.stringContaining("timeout --kill-after=5s 120s bash -c 'pnpm test'"),
+        { timeout: computeOuterTimeoutMs(LOCKED_EXEC_MAX_TIMEOUT_MS) },
+      ],
+      [
+        expect.stringContaining("timeout --kill-after=5s 120s bash -c 'git fetch'"),
+        { timeout: computeOuterTimeoutMs(CHECKOUT_EXEC_DEFAULT_TIMEOUT_MS) },
+      ],
+      [
+        expect.stringContaining("timeout --kill-after=5s 300s bash -c 'pnpm install'"),
+        { timeout: computeOuterTimeoutMs(INSTALL_EXEC_DEFAULT_TIMEOUT_MS) },
+      ],
+    ]);
+
+    // 不正な timeoutMs は resetContainer 破棄や exec 実行の前に RangeError で拒否される
+    mocks.destroy.mockClear();
+    mocks.exec.mockClear();
+    await expect(
+      instance.execWithEgress("git fetch", {
+        timeoutMs: Number.NaN,
+        egress: { profile: "checkout", repository: "octo/repo", resetContainer: true },
+      }),
+    ).rejects.toThrow(RangeError);
+    expect(mocks.destroy).not.toHaveBeenCalled();
+    expect(mocks.exec).not.toHaveBeenCalled();
+  });
+
+  it("コンテナ側でタイムアウトマーカーが出力された場合は timedOut: true と exitCode: 124 に正規化する", async () => {
+    const { instance, mocks, waitForInit } = createReviewSandbox();
+    await waitForInit();
+    mocks.exec.mockImplementationOnce(async (wrappedCmd: string) => {
+      const markerMatch = wrappedCmd.match(/__SANDBOX_TIMEOUT_[0-9a-f-]+__/);
+      expect(markerMatch?.[0]).toBeDefined();
+      return {
+        stdout: "before hang",
+        stderr: `partial err\n${markerMatch?.[0]}\n`,
+        exitCode: 124,
+      };
+    });
+
+    const result = await instance.execWithEgress("sleep 999", { timeoutMs: 2_000 });
+
+    expect(result).toEqual({
+      stdout: "before hang",
+      stderr: "partial err\ncommand timed out after 2000ms",
+      exitCode: 124,
+      timedOut: true,
+    });
+  });
+
+  it("destroyGuarded は認証破棄・locked 復帰試行のうえ必ず destroy を実行し、setOutboundHandler 失敗時や poisoned 状態でも破棄できる", async () => {
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { instance, mocks, waitForInit } = createReviewSandbox();
+    await waitForInit();
+    mocks.setOutboundHandler.mockClear();
+
+    // 1. setOutboundHandler("locked") が失敗しても destroy() は必ず呼ばれる
+    mocks.setOutboundHandler.mockRejectedValueOnce(new Error("locked reset failed"));
+    await instance.destroyGuarded("sandbox-logical-destroy");
+
+    expect(mocks.destroy).toHaveBeenCalledTimes(1);
+    expect(infoSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "sandbox.lifecycle.destroy",
+        outcome: "success",
+        logicalSandboxId: "sandbox-logical-destroy",
+        resetError: "locked reset failed",
+      }),
+    );
+
+    // 2. locked 復帰失敗で poisoned 状態になった後でも destroyGuarded() は破棄できる
+    mocks.exec.mockResolvedValueOnce({ stdout: "", stderr: "", exitCode: 0 });
+    mocks.setOutboundHandler.mockImplementation(async (method: string) => {
+      if (method === "locked") {
+        throw new Error("locked rpc down");
+      }
+    });
+    await expect(
+      instance.execWithEgress("pnpm install", { egress: { profile: "install" } }),
+    ).rejects.toThrow("locked rpc down");
+    expect(errorSpy).toHaveBeenCalled();
+
+    mocks.destroy.mockClear();
+    await instance.destroyGuarded("sandbox-poisoned");
+    expect(mocks.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("checkout 実行中に destroyGuarded が割り込んだ場合は #destroyEpoch 変化を検知して中断し、locked へ復帰する", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const { instance, mocks, waitForInit } = createReviewSandbox();
+    await waitForInit();
+    mocks.setOutboundHandler.mockClear();
+
+    let releaseExec!: () => void;
+    const execGate = new Promise<void>((resolve) => {
+      releaseExec = resolve;
+    });
+    mocks.exec.mockImplementationOnce(async () => {
+      await execGate;
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+
+    const checkoutPromise = instance.execWithEgress("git fetch", {
+      egress: { profile: "checkout", repository: "octo/repo", githubToken: "ghs_race" },
+    });
+    await vi.waitFor(() => expect(mocks.exec).toHaveBeenCalledTimes(1));
+
+    await instance.destroyGuarded("sandbox-race");
+    releaseExec();
+
+    await expect(checkoutPromise).rejects.toThrow("sandbox was destroyed during checkout phase");
+    expect(mocks.setOutboundHandler.mock.calls.at(-1)?.[0]).toBe("locked");
+  });
+
+  it("ゲート待機中の exclusive / locked 操作は destroyGuarded 後にコンテナを再起動・egress 再開放せず中断する", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const { instance, mocks, waitForInit } = createReviewSandbox();
+    await waitForInit();
+    mocks.setOutboundHandler.mockClear();
+
+    let releaseFirstExec!: () => void;
+    const firstExecGate = new Promise<void>((resolve) => {
+      releaseFirstExec = resolve;
+    });
+    mocks.exec.mockImplementationOnce(async () => {
+      await firstExecGate;
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+
+    const firstInstall = instance.execWithEgress("pnpm install", {
+      egress: { profile: "install" },
+    });
+    await vi.waitFor(() => expect(mocks.exec).toHaveBeenCalledTimes(1));
+
+    // 先行 install 実行中に、後続の checkout / locked exec / readFile / writeFile / listFiles をキューへ積む
+    const queuedCheckout = instance.execWithEgress("git fetch", {
+      egress: { profile: "checkout", repository: "octo/repo", githubToken: "ghs_queued" },
+    });
+    const queuedLockedExec = instance.execWithEgress("echo revive");
+    const queuedRead = instance.readFileGuarded("src/index.ts");
+    const queuedWrite = instance.writeFileGuarded("tmp.txt", "x");
+    const queuedList = instance.listFilesGuarded(".");
+    await Promise.resolve();
+
+    // 待機中に destroyGuarded() が走る
+    await instance.destroyGuarded("sandbox-queued-destroy");
+    releaseFirstExec();
+
+    await expect(firstInstall).rejects.toThrow("sandbox was destroyed during install phase");
+    await expect(queuedCheckout).rejects.toThrow("sandbox was destroyed during checkout phase");
+    await expect(queuedLockedExec).rejects.toThrow("sandbox was destroyed during locked phase");
+    await expect(queuedRead).rejects.toThrow("sandbox was destroyed during locked phase");
+    await expect(queuedWrite).rejects.toThrow("sandbox was destroyed during locked phase");
+    await expect(queuedList).rejects.toThrow("sandbox was destroyed during locked phase");
+
+    // 待機していた操作はいずれも実行されず、checkout egress も再適用されない
+    expect(mocks.exec).toHaveBeenCalledTimes(1);
+    expect(mocks.readFile).not.toHaveBeenCalled();
+    expect(mocks.writeFile).not.toHaveBeenCalled();
+    expect(mocks.listFiles).not.toHaveBeenCalled();
+    expect(mocks.setOutboundHandler.mock.calls.some(([method]) => method === "checkout")).toBe(
+      false,
+    );
+  });
+
+  it("resetContainer: true の checkout はコールドスタート予算を含めた egress TTL を設定する", async () => {
+    const { instance, mocks, waitForInit } = createReviewSandbox();
+    await waitForInit();
+    mocks.setOutboundHandler.mockClear();
+    mocks.exec.mockResolvedValueOnce({ stdout: "", stderr: "", exitCode: 0 });
+
+    const before = Date.now();
+    await instance.execWithEgress("git fetch", {
+      egress: {
+        profile: "checkout",
+        repository: "octo/repo",
+        githubToken: "ghs_coldstart",
+        resetContainer: true,
+      },
+    });
+
+    const checkoutParams = mocks.setOutboundHandler.mock.calls.find(
+      ([method]) => method === "checkout",
+    )?.[1] as { expiresAt: number };
+    // CHECKOUT_EXEC_DEFAULT_TIMEOUT_MS (120s) + CONTAINER_STARTUP_BUFFER_MS (120s) + grace (5s) = 245s
+    expect(checkoutParams.expiresAt - before).toBeGreaterThanOrEqual(240_000);
+  });
 });
 
 describe("SandboxEntrypoint", () => {
@@ -582,7 +808,7 @@ describe("SandboxEntrypoint", () => {
     vi.clearAllMocks();
   });
 
-  it("writeFile / readFile / listFiles / exec を ReviewSandbox のガード付きメソッドへ委譲する", async () => {
+  it("writeFile / readFile / listFiles / exec / destroy を ReviewSandbox のガード付きメソッドへ委譲する", async () => {
     sandboxStub.writeFileGuarded.mockResolvedValue(undefined);
     sandboxStub.readFileGuarded.mockResolvedValue("hello");
     sandboxStub.listFilesGuarded.mockResolvedValue(["repro.txt", "README.md"]);
@@ -591,33 +817,40 @@ describe("SandboxEntrypoint", () => {
       stderr: "",
       exitCode: 0,
     });
+    sandboxStub.destroyGuarded.mockResolvedValue(undefined);
 
     await entrypoint.writeFile("sandbox-1", "repro.txt", "hello");
     const content = await entrypoint.readFile("sandbox-1", "repro.txt");
     const files = await entrypoint.listFiles("sandbox-1", ".");
     const execResult = await entrypoint.exec("sandbox-1", "cat repro.txt", {
       egress: { profile: "install" },
+      timeoutMs: 30_000,
     });
+    await entrypoint.destroy("sandbox-1");
 
     expect(content).toBe("hello");
     expect(files).toEqual(["repro.txt", "README.md"]);
     expect(execResult).toEqual({ stdout: "hello\n", stderr: "", exitCode: 0 });
     expect(sandboxStub.execWithEgress).toHaveBeenCalledWith(
       "cat repro.txt",
-      { egress: { profile: "install" } },
+      { egress: { profile: "install" }, timeoutMs: 30_000 },
       "sandbox-1",
     );
+    expect(sandboxStub.destroyGuarded).toHaveBeenCalledWith("sandbox-1");
   });
 
   it("64 文字の DurableObjectId を @cloudflare/sandbox の上限である 63 文字に切り詰めて渡す", async () => {
     sandboxStub.listFilesGuarded.mockResolvedValue([]);
+    sandboxStub.destroyGuarded.mockResolvedValue(undefined);
     const durableObjectId = "a".repeat(64);
 
     await entrypoint.listFiles(durableObjectId, ".");
+    await entrypoint.destroy(durableObjectId);
 
     expect(getSandboxMock).toHaveBeenCalledWith(namespace, "a".repeat(63), {
       normalizeId: true,
     });
+    expect(sandboxStub.destroyGuarded).toHaveBeenCalledWith(durableObjectId);
   });
 });
 

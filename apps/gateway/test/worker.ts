@@ -23,6 +23,25 @@ export const executedCalls: Array<{
 /** sandboxId ごとのインメモリファイルシステム。 */
 export const sandboxFiles = new Map<string, Map<string, string>>();
 
+/** destroy() が成功した sandboxId の記録。 */
+export const destroyedSandboxes: string[] = [];
+
+/** テストから破棄失敗・ハング・タイムアウト・TTL 短縮を注入するための設定。 */
+export const sandboxTestConfig = {
+  destroyFailuresRemaining: 0,
+  destroyHangCount: 0,
+  destroyDelayMs: 400,
+  installDelayMs: null as number | null,
+  hangCommand: null as string | null,
+  checkoutTimeoutSha: null as string | null,
+  maxLifetimeMs: null as number | null,
+  cleanupPollMs: null as number | null,
+  destroyRetryBaseDelayMs: null as number | null,
+  destroyTimeoutMs: null as number | null,
+};
+
+const sandboxDestroyCounts = new Map<string, number>();
+
 /** `<repository>@<headSha>` ごとに git fetch / checkout で展開されるリモートファイル群。 */
 export const remoteRepoFiles = new Map<string, Record<string, string>>();
 
@@ -72,6 +91,15 @@ export class SandboxEntrypoint extends WorkerEntrypoint implements SandboxServic
           exitCode: 128,
         };
       }
+      if (sha !== undefined && sha === sandboxTestConfig.checkoutTimeoutSha) {
+        const leaked = checkoutToken ? btoa(`x-access-token:${checkoutToken}`) : "no-token";
+        return {
+          stdout: "",
+          stderr: `command timed out after 120000ms (${leaked})`,
+          exitCode: 124,
+          timedOut: true,
+        };
+      }
       const files = filesOf(sandboxId);
       files.clear();
       const repoFiles = remoteRepoFiles.get(`${repo}@${sha}`) ?? remoteRepoFiles.get(sha ?? "");
@@ -83,6 +111,9 @@ export class SandboxEntrypoint extends WorkerEntrypoint implements SandboxServic
       return { stdout: "", stderr: "", exitCode: 0 };
     }
     if (INSTALL_COMMAND_PATTERN.test(command)) {
+      if (sandboxTestConfig.installDelayMs !== null) {
+        await new Promise((resolve) => setTimeout(resolve, sandboxTestConfig.installDelayMs ?? 0));
+      }
       const files = filesOf(sandboxId);
       if (files.get("package.json")?.includes('"fail-install"')) {
         return {
@@ -100,6 +131,19 @@ export class SandboxEntrypoint extends WorkerEntrypoint implements SandboxServic
         stderr: "",
         exitCode: 0,
       };
+    }
+    if (sandboxTestConfig.hangCommand !== null && command === sandboxTestConfig.hangCommand) {
+      // Workers の cross-request I/O 制限に抵触しないよう、別リクエストから reject を直接呼ばず
+      // 同一リクエストコンテキスト内のタイマーで destroy カウンタ変化を監視する
+      const destroyCountAtStart = sandboxDestroyCounts.get(sandboxId) ?? 0;
+      return new Promise<ExecResult>((_resolve, reject) => {
+        const timer = setInterval(() => {
+          if ((sandboxDestroyCounts.get(sandboxId) ?? 0) > destroyCountAtStart) {
+            clearInterval(timer);
+            reject(new Error("The sandbox was destroyed while the operation was pending."));
+          }
+        }, 10);
+      });
     }
     if (command.startsWith("cat ")) {
       const path = command.slice("cat ".length).trim();
@@ -127,6 +171,21 @@ export class SandboxEntrypoint extends WorkerEntrypoint implements SandboxServic
   async listFiles(sandboxId: string, _path: string): Promise<string[]> {
     return [...filesOf(sandboxId).keys()];
   }
+
+  async destroy(sandboxId: string): Promise<void> {
+    if (sandboxTestConfig.destroyHangCount > 0) {
+      sandboxTestConfig.destroyHangCount -= 1;
+      await new Promise((resolve) => setTimeout(resolve, sandboxTestConfig.destroyDelayMs));
+      throw new Error("simulated hung sandbox destroy");
+    }
+    if (sandboxTestConfig.destroyFailuresRemaining > 0) {
+      sandboxTestConfig.destroyFailuresRemaining -= 1;
+      throw new Error("simulated sandbox destroy failure");
+    }
+    destroyedSandboxes.push(sandboxId);
+    sandboxDestroyCounts.set(sandboxId, (sandboxDestroyCounts.get(sandboxId) ?? 0) + 1);
+    sandboxFiles.delete(sandboxId);
+  }
 }
 
 /** モデルだけを擬似モデルに差し替えた ReviewOrchestrator。PiHarness・SQLite・RUNNER RPC・GitHubPort 配線は本物を使う。 */
@@ -135,5 +194,21 @@ export class ReviewOrchestrator extends ProductionOrchestrator {
     const models = createModels();
     models.setProvider(faux.provider);
     return models;
+  }
+
+  protected override sandboxMaxLifetimeMs(): number {
+    return sandboxTestConfig.maxLifetimeMs ?? super.sandboxMaxLifetimeMs();
+  }
+
+  protected override sandboxCleanupPollMs(): number {
+    return sandboxTestConfig.cleanupPollMs ?? super.sandboxCleanupPollMs();
+  }
+
+  protected override sandboxDestroyRetryBaseDelayMs(): number {
+    return sandboxTestConfig.destroyRetryBaseDelayMs ?? super.sandboxDestroyRetryBaseDelayMs();
+  }
+
+  protected override sandboxDestroyTimeoutMs(): number {
+    return sandboxTestConfig.destroyTimeoutMs ?? super.sandboxDestroyTimeoutMs();
   }
 }
