@@ -40,11 +40,15 @@ describe("ReviewOrchestrator", () => {
     sandboxFiles.clear();
     remoteRepoFiles.clear();
     sandboxTestConfig.destroyFailuresRemaining = 0;
+    sandboxTestConfig.destroyHangCount = 0;
+    sandboxTestConfig.destroyDelayMs = 400;
+    sandboxTestConfig.installDelayMs = null;
     sandboxTestConfig.hangCommand = null;
     sandboxTestConfig.checkoutTimeoutSha = null;
     sandboxTestConfig.maxLifetimeMs = null;
     sandboxTestConfig.cleanupPollMs = null;
     sandboxTestConfig.destroyRetryBaseDelayMs = null;
+    sandboxTestConfig.destroyTimeoutMs = null;
     clearInstallationTokenCache();
     vi.stubGlobal(
       "fetch",
@@ -1015,6 +1019,217 @@ describe("ReviewOrchestrator", () => {
         expect(active).toBe(0);
       },
       { timeout: 3_000 },
+    );
+  });
+
+  it("破棄 RPC がハングしても上限時間で打ち切り、次回 start() を停止させず再試行ジョブで回収する", async () => {
+    sandboxTestConfig.destroyHangCount = 1;
+    sandboxTestConfig.destroyDelayMs = 500;
+    sandboxTestConfig.destroyTimeoutMs = 40;
+    sandboxTestConfig.destroyRetryBaseDelayMs = 120;
+
+    // 1. 破棄ハング時に result() がタイムアウト上限で戻り、永続リトライジョブで後から破棄完了する
+    faux.setResponses([fauxAssistantMessage(fauxText("1回目完了"))]);
+    const stub1 = env.ORCHESTRATOR.getByName("octo/repo#978");
+    await stub1.start({
+      ...request,
+      deliveryId: "del-hang-retry",
+      pullNumber: 978,
+      headSha: "sha-hang-1",
+    });
+
+    const startedWait = Date.now();
+    const res1 = await stub1.result("del-hang-retry");
+    expect(res1).toMatchObject({ status: "done", text: "1回目完了" });
+    // 500ms のハング完了を待たずに破棄タイムアウト (40ms) で返ること
+    expect(Date.now() - startedWait).toBeLessThan(350);
+    expect(destroyedSandboxes).toHaveLength(0);
+
+    await vi.waitFor(
+      () => {
+        expect(destroyedSandboxes).toHaveLength(1);
+      },
+      { timeout: 2_000 },
+    );
+
+    // 2. 破棄がハングした直後でも同じ PR の次回 start() が無期限停止せず完了する
+    sandboxTestConfig.destroyHangCount = 1;
+    faux.setResponses([
+      fauxAssistantMessage(fauxText("先行完了")),
+      fauxAssistantMessage(fauxText("後続完了")),
+    ]);
+    const stub2 = env.ORCHESTRATOR.getByName("octo/repo#979");
+    await stub2.start({
+      ...request,
+      deliveryId: "del-hang-first",
+      pullNumber: 979,
+      headSha: "sha-hang-a",
+    });
+    const firstOutcome = await stub2.result("del-hang-first");
+    expect(firstOutcome).toMatchObject({ status: "done", text: "先行完了" });
+
+    const secondStartAt = Date.now();
+    await stub2.start({
+      ...request,
+      deliveryId: "del-hang-second",
+      pullNumber: 979,
+      headSha: "sha-hang-b",
+    });
+    const secondOutcome = await stub2.result("del-hang-second");
+    expect(secondOutcome).toMatchObject({ status: "done", text: "後続完了" });
+    expect(Date.now() - secondStartAt).toBeLessThan(350);
+  });
+
+  it("後片付けの事前・事後処理（ジョブ登録/解除）が例外を投げてもレビュー結果や元のセットアップエラーを失わず次回開始も成功する", async () => {
+    const stub = env.ORCHESTRATOR.getByName("octo/repo#980");
+
+    // 1. レビュー完了後のジョブ解除が一時失敗しても result() は成功結果を返し、次回 start() も通る
+    faux.setResponses([
+      fauxAssistantMessage(fauxText("完了結果1")),
+      fauxAssistantMessage(fauxText("完了結果2")),
+    ]);
+    await stub.start({
+      ...request,
+      deliveryId: "del-cleanup-err-1",
+      pullNumber: 980,
+      headSha: "sha-err-1",
+    });
+    await runInDurableObject(stub, (instance) => {
+      const lifecycle = (
+        instance as unknown as {
+          lifecycle: {
+            jobs: {
+              push(opts: unknown): Promise<unknown>;
+              cancel(id: string): Promise<boolean>;
+              get(id: string): unknown;
+              list(): unknown[];
+              reschedule(id: string, time: number): Promise<boolean>;
+              rearm(): Promise<void>;
+            };
+          };
+        }
+      ).lifecycle;
+      const origJobs = lifecycle.jobs;
+      let failedOnce = false;
+      Object.defineProperty(lifecycle, "jobs", {
+        configurable: true,
+        get() {
+          return {
+            ...origJobs,
+            cancel: async (id: string) => {
+              if (!failedOnce) {
+                failedOnce = true;
+                throw new Error("simulated job cancel error");
+              }
+              return origJobs.cancel(id);
+            },
+          };
+        },
+      });
+    });
+
+    // waitUntil / result() のどちらで cancel が走ってもレビュー結果自体は正常に返る
+    const res1 = await stub.result("del-cleanup-err-1");
+    expect(res1).toMatchObject({ status: "done", text: "完了結果1" });
+
+    // 次回 start() も後片付けエラーを引きずらず成功する
+    await stub.start({
+      ...request,
+      deliveryId: "del-cleanup-err-2",
+      pullNumber: 980,
+      headSha: "sha-err-2",
+    });
+    const res2 = await stub.result("del-cleanup-err-2");
+    expect(res2).toMatchObject({ status: "done", text: "完了結果2" });
+
+    // 2. セットアップ失敗時の後片付けで事前処理（jobs.push）が例外を投げても、元のセットアップエラーを失わない
+    remoteRepoFiles.set("octo/repo@sha-setup-err-cleanup-err", {
+      "package.json": JSON.stringify({ name: "fail-install", scripts: { test: "vitest run" } }),
+      "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    });
+    const stubSetup = env.ORCHESTRATOR.getByName("octo/repo#981");
+    await runInDurableObject(stubSetup, async (instance) => {
+      const orchestrator = instance as ProductionOrchestrator;
+      const lifecycle = (
+        instance as unknown as {
+          lifecycle: {
+            jobs: {
+              push(opts: unknown): Promise<unknown>;
+              cancel(id: string): Promise<boolean>;
+              get(id: string): unknown;
+              list(): unknown[];
+              reschedule(id: string, time: number): Promise<boolean>;
+              rearm(): Promise<void>;
+            };
+          };
+        }
+      ).lifecycle;
+      const origJobs = lifecycle.jobs;
+      let pushCalls = 0;
+      Object.defineProperty(lifecycle, "jobs", {
+        configurable: true,
+        get() {
+          return {
+            ...origJobs,
+            push: async (opts: unknown) => {
+              pushCalls += 1;
+              // 1 回目は checkout 開始時の予約なので通し、2 回目（setup_failed 後片付けの事前処理）で失敗させる
+              if (pushCalls === 2) {
+                throw new Error("simulated cleanup push error");
+              }
+              return origJobs.push(opts);
+            },
+          };
+        },
+      });
+
+      await expect(
+        orchestrator.start({
+          ...request,
+          deliveryId: "del-setup-err-preserve",
+          pullNumber: 981,
+          headSha: "sha-setup-err-cleanup-err",
+        }),
+      ).rejects.toThrow(
+        'failed to install dependencies with "pnpm install --frozen-lockfile" (exit 1): ERR_INSTALL_FAILED: registry error',
+      );
+    });
+  });
+
+  it("強制破棄の失敗後にセットアップ失敗の後片付けが走っても、予約済み pendingDestroy 再試行ジョブを解除せず回収する", async () => {
+    remoteRepoFiles.set("octo/repo@sha-force-then-setup-fail", {
+      "package.json": JSON.stringify({ name: "slow-app", scripts: { test: "vitest run" } }),
+      "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    });
+    sandboxTestConfig.maxLifetimeMs = 80;
+    sandboxTestConfig.cleanupPollMs = 80;
+    sandboxTestConfig.installDelayMs = 150;
+    sandboxTestConfig.destroyFailuresRemaining = 1;
+    sandboxTestConfig.destroyRetryBaseDelayMs = 150;
+
+    const stub = env.ORCHESTRATOR.getByName("octo/repo#982");
+
+    // セットアップ中に TTL 超過の強制破棄（1 回目 destroy 失敗 → sandbox_active=0 で pendingDestroy 予約）が起き、
+    // 直後にセットアップが失敗して setup_failed の後片付けが走っても pendingDestroy ジョブは解除されない
+    await runInDurableObject(stub, async (instance) => {
+      const orchestrator = instance as ProductionOrchestrator;
+      await expect(
+        orchestrator.start({
+          ...request,
+          deliveryId: "del-force-setup-race",
+          pullNumber: 982,
+          headSha: "sha-force-then-setup-fail",
+        }),
+      ).rejects.toThrow("sandbox was destroyed while preparing target");
+    });
+
+    // 1 回目は強制破棄が失敗しているため未破棄だが、pendingDestroy ジョブが生きておりリトライで破棄完了する
+    expect(destroyedSandboxes).toHaveLength(0);
+    await vi.waitFor(
+      () => {
+        expect(destroyedSandboxes).toHaveLength(1);
+      },
+      { timeout: 2_000 },
     );
   });
 });

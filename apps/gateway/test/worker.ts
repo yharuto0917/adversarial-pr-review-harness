@@ -29,11 +29,15 @@ export const destroyedSandboxes: string[] = [];
 /** テストから破棄失敗・ハング・タイムアウト・TTL 短縮を注入するための設定。 */
 export const sandboxTestConfig = {
   destroyFailuresRemaining: 0,
+  destroyHangCount: 0,
+  destroyDelayMs: 400,
+  installDelayMs: null as number | null,
   hangCommand: null as string | null,
   checkoutTimeoutSha: null as string | null,
   maxLifetimeMs: null as number | null,
   cleanupPollMs: null as number | null,
   destroyRetryBaseDelayMs: null as number | null,
+  destroyTimeoutMs: null as number | null,
 };
 
 const sandboxDestroyCounts = new Map<string, number>();
@@ -107,6 +111,9 @@ export class SandboxEntrypoint extends WorkerEntrypoint implements SandboxServic
       return { stdout: "", stderr: "", exitCode: 0 };
     }
     if (INSTALL_COMMAND_PATTERN.test(command)) {
+      if (sandboxTestConfig.installDelayMs !== null) {
+        await new Promise((resolve) => setTimeout(resolve, sandboxTestConfig.installDelayMs ?? 0));
+      }
       const files = filesOf(sandboxId);
       if (files.get("package.json")?.includes('"fail-install"')) {
         return {
@@ -166,6 +173,11 @@ export class SandboxEntrypoint extends WorkerEntrypoint implements SandboxServic
   }
 
   async destroy(sandboxId: string): Promise<void> {
+    if (sandboxTestConfig.destroyHangCount > 0) {
+      sandboxTestConfig.destroyHangCount -= 1;
+      await new Promise((resolve) => setTimeout(resolve, sandboxTestConfig.destroyDelayMs));
+      throw new Error("simulated hung sandbox destroy");
+    }
     if (sandboxTestConfig.destroyFailuresRemaining > 0) {
       sandboxTestConfig.destroyFailuresRemaining -= 1;
       throw new Error("simulated sandbox destroy failure");
@@ -194,5 +206,9 @@ export class ReviewOrchestrator extends ProductionOrchestrator {
 
   protected override sandboxDestroyRetryBaseDelayMs(): number {
     return sandboxTestConfig.destroyRetryBaseDelayMs ?? super.sandboxDestroyRetryBaseDelayMs();
+  }
+
+  protected override sandboxDestroyTimeoutMs(): number {
+    return sandboxTestConfig.destroyTimeoutMs ?? super.sandboxDestroyTimeoutMs();
   }
 }

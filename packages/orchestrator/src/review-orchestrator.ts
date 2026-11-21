@@ -29,6 +29,9 @@ export const DEFAULT_SANDBOX_MAX_LIFETIME_MS = 30 * 60 * 1_000;
 /** DO 退避などで完了監視が失われた場合にアイドル破棄を救済するポーリング間隔（既定 60 秒）。 */
 export const DEFAULT_SANDBOX_CLEANUP_POLL_MS = 60 * 1_000;
 
+/** 破棄 RPC の待機上限（既定 30 秒）。制御プレーン無応答時に次回チェックアウトを止めないための上限。 */
+export const DEFAULT_SANDBOX_DESTROY_TIMEOUT_MS = 30_000;
+
 const SANDBOX_CLEANUP_JOB_ID = "sandbox-cleanup";
 const SANDBOX_CLEANUP_JOB_FN = "cleanupSandbox";
 const SANDBOX_CLEANUP_HUNG_TIMEOUT_SECONDS = 120;
@@ -182,11 +185,21 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
       } finally {
         this.#admittingStarts -= 1;
         // 共有 #inflightSetup を含め全ての並行 start() が受付を終えた時点で、
-        // 他に進行中レビューが無ければ失敗したセットアップのコンテナを即座に破棄する
+        // 他に進行中レビューが無ければ失敗したセットアップのコンテナを即座に破棄する。
+        // 元のセットアップエラーを失わないよう後片付けの二次例外はすべて捕捉してログに留める。
         if (setupFailed && this.#admittingStarts === 0 && this.#inflightSetup === null) {
-          const pending = await this.harness.pending().catch(() => null);
-          if (pending !== null && pending.length === 0 && this.#admittingStarts === 0) {
-            await this.#destroySandbox("setup_failed", { swallowErrors: true });
+          try {
+            const pending = await this.harness.pending().catch(() => null);
+            if (pending !== null && pending.length === 0 && this.#admittingStarts === 0) {
+              await this.#destroySandbox("setup_failed", { swallowErrors: true });
+            }
+          } catch (cleanupError) {
+            console.error({
+              event: "orchestrator.sandbox.cleanup_error",
+              sandboxId: this.ctx.id.toString(),
+              reason: "setup_failed",
+              error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+            });
           }
         }
       }
@@ -236,8 +249,7 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
       }
 
       if (payload?.pendingDestroy) {
-        await this.#retryPendingDestroy(payload.generation, payload.retryCount ?? 0);
-        return;
+        return await this.#retryPendingDestroy(payload.generation, payload.retryCount ?? 0);
       }
 
       if (!target.sandboxActive) {
@@ -294,6 +306,11 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
   /** テストで破棄失敗時のリトライ基準待機時間を差し替えるための継ぎ目。 */
   protected sandboxDestroyRetryBaseDelayMs(): number {
     return DEFAULT_DESTROY_RETRY_BASE_DELAY_MS;
+  }
+
+  /** テストで破棄 RPC の待機上限を差し替えるための継ぎ目。 */
+  protected sandboxDestroyTimeoutMs(): number {
+    return DEFAULT_SANDBOX_DESTROY_TIMEOUT_MS;
   }
 
   /** テストで擬似モデルに差し替えるための継ぎ目。 */
@@ -456,9 +473,9 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
    * 側でオンメモリ注入し、コンテナ内のコマンド引数・環境変数・ファイルには一切渡さない。
    */
   async #checkoutHead(): Promise<readonly string[]> {
-    // 進行中の後片付けが完了してからセットアップを開始し、破棄と作成の競合を防ぐ
+    // 進行中の後片付けが終わるまで上限時間付きで待ち、破棄ハングで次回開始が永久停止するのを防ぐ
     if (this.#inflightCleanup) {
-      await this.#inflightCleanup;
+      await waitWithTimeout(this.#inflightCleanup, this.sandboxDestroyTimeoutMs());
     }
 
     this.#ensureSchema();
@@ -558,43 +575,47 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
       return this.#inflightIdleCheck;
     }
     const run = async (): Promise<void> => {
-      if (this.#inflightCleanup) {
-        await this.#inflightCleanup;
-      }
-      const target = this.#getTarget();
-      if (!target?.sandboxActive) {
-        return;
-      }
-      // すでに現行世代の pendingDestroy バックオフ再試行が予約済みなら、上書き再実行せずジョブに委ねる
-      const existingJob = this.lifecycle.jobs.get(SANDBOX_CLEANUP_JOB_ID);
-      const existingPayload = parseCleanupJobPayload(existingJob?.payload);
-      if (
-        existingPayload?.pendingDestroy === true &&
-        existingPayload.generation === target.sandboxGeneration
-      ) {
-        return;
-      }
-      if (this.#admittingStarts > 0 || this.#inflightSetup !== null) {
-        return;
-      }
-      const pending = await this.harness.pending();
-      if (pending.length > 0) {
-        return;
-      }
-      if (this.#admittingStarts > 0 || this.#inflightSetup !== null) {
-        return;
-      }
-      const latest = this.#getTarget();
-      if (!latest?.sandboxActive || latest.sandboxGeneration !== target.sandboxGeneration) {
+      try {
         if (this.#inflightCleanup) {
-          await this.#inflightCleanup;
+          await waitWithTimeout(this.#inflightCleanup, this.sandboxDestroyTimeoutMs());
         }
-        return;
+        const target = this.#getTarget();
+        if (!target?.sandboxActive) {
+          return;
+        }
+        // すでに現行世代の pendingDestroy バックオフ再試行が予約済みなら、上書き再実行せずジョブに委ねる
+        if (this.#hasPendingDestroyJob(target.sandboxGeneration)) {
+          return;
+        }
+        if (this.#admittingStarts > 0 || this.#inflightSetup !== null) {
+          return;
+        }
+        const pending = await this.harness.pending();
+        if (pending.length > 0) {
+          return;
+        }
+        if (this.#admittingStarts > 0 || this.#inflightSetup !== null) {
+          return;
+        }
+        const latest = this.#getTarget();
+        if (!latest?.sandboxActive || latest.sandboxGeneration !== target.sandboxGeneration) {
+          if (this.#inflightCleanup) {
+            await waitWithTimeout(this.#inflightCleanup, this.sandboxDestroyTimeoutMs());
+          }
+          return;
+        }
+        await this.#destroySandbox("review_completed", {
+          expectedGeneration: target.sandboxGeneration,
+          swallowErrors: true,
+        });
+      } catch (error) {
+        console.error({
+          event: "orchestrator.sandbox.cleanup_error",
+          sandboxId: this.ctx.id.toString(),
+          reason: "review_completed",
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
-      await this.#destroySandbox("review_completed", {
-        expectedGeneration: target.sandboxGeneration,
-        swallowErrors: true,
-      });
     };
 
     const check = run();
@@ -652,107 +673,146 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
   ): Promise<{ readonly destroyed: boolean }> {
     const previous = this.#inflightCleanup;
     const run = async (): Promise<{ readonly destroyed: boolean }> => {
-      if (previous) {
-        await previous;
-      }
-
-      const target = this.#getTarget();
-      if (!target?.sandboxActive) {
-        await this.lifecycle.jobs.cancel(SANDBOX_CLEANUP_JOB_ID);
-        return { destroyed: false };
-      }
-      if (
-        options.expectedGeneration !== undefined &&
-        target.sandboxGeneration !== options.expectedGeneration
-      ) {
-        return { destroyed: false };
-      }
-
-      const nextGeneration = target.sandboxGeneration + 1;
-      if (options.forceAbort) {
-        // 強制破棄時は先に sandbox_active = 0・世代更新を確定させ、Pi によるゾンビ再生成を防ぐ
-        this.ctx.storage.sql.exec(
-          `UPDATE review_target
-           SET checked_out_sha = NULL,
-               test_commands_json = '[]',
-               sandbox_active = 0,
-               sandbox_generation = ?,
-               sandbox_expires_at = NULL
-           WHERE id = 1`,
-          nextGeneration,
-        );
-      } else {
-        this.ctx.storage.sql.exec(
-          `UPDATE review_target
-           SET checked_out_sha = NULL,
-               test_commands_json = '[]',
-               sandbox_generation = ?
-           WHERE id = 1`,
-          nextGeneration,
-        );
-      }
-
-      // RUNNER.destroy() 待機中に DO が退避・再起動・ハングした場合でも世代不一致で
-      // クリーンアップジョブが自己消滅しないよう、RPC 実行前に新世代の pendingDestroy を永続化する。
-      await this.#scheduleCleanupJob(
-        nextGeneration,
-        Date.now() + this.sandboxDestroyRetryBaseDelayMs(),
-        { pendingDestroy: true, retryCount: 0 },
-      );
-
       const sandboxId = this.ctx.id.toString();
-      // 強制破棄時は abort() を先に開始しつつ待たずに RUNNER.destroy() で実行中 RPC を切断し、
-      // デッドロックを回避してから上限時間付きで abort 完了を待つ
-      const abortPromise = options.forceAbort
-        ? this.harness.abort().catch((error: unknown) => {
+      try {
+        if (previous) {
+          await waitWithTimeout(previous, this.sandboxDestroyTimeoutMs());
+        }
+
+        const target = this.#getTarget();
+        if (!target?.sandboxActive) {
+          // 強制破棄（forceAbort）失敗直後は sandbox_active = 0 のまま現行世代の
+          // pendingDestroy 再試行ジョブが予約されているため、誤って解除しない
+          if (!target || !this.#hasPendingDestroyJob(target.sandboxGeneration)) {
+            await this.lifecycle.jobs.cancel(SANDBOX_CLEANUP_JOB_ID);
+          }
+          return { destroyed: false };
+        }
+        if (
+          options.expectedGeneration !== undefined &&
+          target.sandboxGeneration !== options.expectedGeneration
+        ) {
+          return { destroyed: false };
+        }
+        if (!options.forceAbort && this.#hasPendingDestroyJob(target.sandboxGeneration)) {
+          return { destroyed: false };
+        }
+
+        const nextGeneration = target.sandboxGeneration + 1;
+        if (options.forceAbort) {
+          // 強制破棄時は先に sandbox_active = 0・世代更新を確定させ、Pi によるゾンビ再生成を防ぐ
+          this.ctx.storage.sql.exec(
+            `UPDATE review_target
+             SET checked_out_sha = NULL,
+                 test_commands_json = '[]',
+                 sandbox_active = 0,
+                 sandbox_generation = ?,
+                 sandbox_expires_at = NULL
+             WHERE id = 1`,
+            nextGeneration,
+          );
+        } else {
+          this.ctx.storage.sql.exec(
+            `UPDATE review_target
+             SET checked_out_sha = NULL,
+                 test_commands_json = '[]',
+                 sandbox_generation = ?
+             WHERE id = 1`,
+            nextGeneration,
+          );
+        }
+
+        // RUNNER.destroy() 待機中に DO が退避・再起動・ハングした場合でも世代不一致で
+        // クリーンアップジョブが自己消滅しないよう、RPC 実行前に新世代の pendingDestroy を永続化する。
+        await this.#scheduleCleanupJob(
+          nextGeneration,
+          Date.now() + this.sandboxDestroyRetryBaseDelayMs(),
+          { pendingDestroy: true, retryCount: 0 },
+        );
+
+        // 強制破棄時は abort() を先に開始しつつ待たずに RUNNER.destroy() で実行中 RPC を切断し、
+        // デッドロックを回避してから上限時間付きで abort 完了を待つ
+        const abortPromise = options.forceAbort
+          ? this.harness.abort().catch((error: unknown) => {
+              console.error({
+                event: "orchestrator.sandbox.abort_error",
+                sandboxId,
+                reason,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            })
+          : null;
+
+        try {
+          await this.#destroyWithTimeout(sandboxId);
+        } catch (error) {
+          const retryCount = 1;
+          console.error({
+            event: "orchestrator.sandbox.destroy_failed",
+            sandboxId,
+            reason,
+            retryCount,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          const retryAt = Date.now() + this.sandboxDestroyRetryBaseDelayMs();
+          try {
+            await this.#scheduleCleanupJob(nextGeneration, retryAt, {
+              pendingDestroy: true,
+              retryCount,
+            });
+          } catch (scheduleError) {
             console.error({
-              event: "orchestrator.sandbox.abort_error",
+              event: "orchestrator.sandbox.cleanup_error",
               sandboxId,
               reason,
-              error: error instanceof Error ? error.message : String(error),
+              error: scheduleError instanceof Error ? scheduleError.message : String(scheduleError),
             });
-          })
-        : null;
+          }
+          if (abortPromise) {
+            await waitWithTimeout(abortPromise, ABORT_WAIT_TIMEOUT_MS);
+          }
+          if (options.swallowErrors) {
+            return { destroyed: false };
+          }
+          throw error;
+        }
 
-      try {
-        await this.env.RUNNER.destroy(sandboxId);
-      } catch (error) {
-        const retryCount = 1;
-        console.error({
-          event: "orchestrator.sandbox.destroy_failed",
-          sandboxId,
-          reason,
-          retryCount,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        const retryAt = Date.now() + this.sandboxDestroyRetryBaseDelayMs();
-        await this.#scheduleCleanupJob(nextGeneration, retryAt, {
-          pendingDestroy: true,
-          retryCount,
-        });
+        this.ctx.storage.sql.exec(
+          "UPDATE review_target SET sandbox_active = 0, sandbox_expires_at = NULL WHERE id = 1 AND sandbox_generation = ?",
+          nextGeneration,
+        );
+        try {
+          await this.lifecycle.jobs.cancel(SANDBOX_CLEANUP_JOB_ID);
+        } catch (cancelError) {
+          // 破棄自体は完了済みのため、ジョブ解除の失敗はログに留め後続の onJob に委ねる
+          console.error({
+            event: "orchestrator.sandbox.cleanup_error",
+            sandboxId,
+            reason,
+            error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+          });
+        }
         if (abortPromise) {
           await waitWithTimeout(abortPromise, ABORT_WAIT_TIMEOUT_MS);
         }
+        console.info({
+          event: "orchestrator.sandbox.destroyed",
+          sandboxId,
+          reason,
+        });
+        return { destroyed: true };
+      } catch (error) {
+        console.error({
+          event: "orchestrator.sandbox.cleanup_error",
+          sandboxId,
+          reason,
+          error: error instanceof Error ? error.message : String(error),
+        });
         if (options.swallowErrors) {
           return { destroyed: false };
         }
         throw error;
       }
-
-      this.ctx.storage.sql.exec(
-        "UPDATE review_target SET sandbox_active = 0, sandbox_expires_at = NULL WHERE id = 1 AND sandbox_generation = ?",
-        nextGeneration,
-      );
-      await this.lifecycle.jobs.cancel(SANDBOX_CLEANUP_JOB_ID);
-      if (abortPromise) {
-        await waitWithTimeout(abortPromise, ABORT_WAIT_TIMEOUT_MS);
-      }
-      console.info({
-        event: "orchestrator.sandbox.destroyed",
-        sandboxId,
-        reason,
-      });
-      return { destroyed: true };
     };
 
     const promise = run();
@@ -761,7 +821,7 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
       () => undefined,
     );
     this.#inflightCleanup = tracked;
-    tracked.finally(() => {
+    void tracked.then(() => {
       if (this.#inflightCleanup === tracked) {
         this.#inflightCleanup = null;
       }
@@ -772,61 +832,106 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
   async #retryPendingDestroy(
     expectedGeneration: number,
     previousRetryCount: number,
-  ): Promise<void> {
+  ): Promise<LifecycleJobOutcome> {
     const previous = this.#inflightCleanup;
-    const run = async (): Promise<void> => {
-      if (previous) {
-        await previous;
-      }
-      const target = this.#getTarget();
-      if (!target || target.sandboxGeneration !== expectedGeneration) {
-        return;
-      }
+    const run = async (): Promise<LifecycleJobOutcome> => {
       const sandboxId = this.ctx.id.toString();
       try {
-        await this.env.RUNNER.destroy(sandboxId);
-        this.ctx.storage.sql.exec(
-          "UPDATE review_target SET sandbox_active = 0, sandbox_expires_at = NULL WHERE id = 1 AND sandbox_generation = ?",
-          expectedGeneration,
-        );
-        console.info({
-          event: "orchestrator.sandbox.destroyed",
-          sandboxId,
-          reason: "retry_succeeded",
-        });
-      } catch (error) {
-        const retryCount = previousRetryCount + 1;
-        console.error({
-          event: "orchestrator.sandbox.destroy_failed",
-          sandboxId,
-          reason: "retry",
-          retryCount,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        if (retryCount <= DESTROY_MAX_RETRIES) {
-          const backoffMs = this.sandboxDestroyRetryBaseDelayMs() * 2 ** (retryCount - 1);
-          await this.#scheduleCleanupJob(expectedGeneration, Date.now() + backoffMs, {
-            pendingDestroy: true,
-            retryCount,
-          });
+        if (previous) {
+          await waitWithTimeout(previous, this.sandboxDestroyTimeoutMs());
+        }
+        const target = this.#getTarget();
+        if (!target || target.sandboxGeneration !== expectedGeneration) {
           return;
         }
-        // 最大リトライ到達後は Runner 側 sleepAfter の自動停止に委ねる
-        this.ctx.storage.sql.exec(
-          "UPDATE review_target SET sandbox_active = 0, sandbox_expires_at = NULL WHERE id = 1 AND sandbox_generation = ?",
-          expectedGeneration,
-        );
+        try {
+          await this.#destroyWithTimeout(sandboxId);
+          this.ctx.storage.sql.exec(
+            "UPDATE review_target SET sandbox_active = 0, sandbox_expires_at = NULL WHERE id = 1 AND sandbox_generation = ?",
+            expectedGeneration,
+          );
+          console.info({
+            event: "orchestrator.sandbox.destroyed",
+            sandboxId,
+            reason: "retry_succeeded",
+          });
+          return;
+        } catch (error) {
+          const retryCount = previousRetryCount + 1;
+          console.error({
+            event: "orchestrator.sandbox.destroy_failed",
+            sandboxId,
+            reason: "retry",
+            retryCount,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          if (retryCount <= DESTROY_MAX_RETRIES) {
+            const backoffMs = this.sandboxDestroyRetryBaseDelayMs() * 2 ** (retryCount - 1);
+            await this.#scheduleCleanupJob(expectedGeneration, Date.now() + backoffMs, {
+              pendingDestroy: true,
+              retryCount,
+            });
+            return;
+          }
+          // 最大リトライ到達後は Runner 側 sleepAfter の自動停止に委ねる
+          this.ctx.storage.sql.exec(
+            "UPDATE review_target SET sandbox_active = 0, sandbox_expires_at = NULL WHERE id = 1 AND sandbox_generation = ?",
+            expectedGeneration,
+          );
+          return;
+        }
+      } catch (error) {
+        console.error({
+          event: "orchestrator.sandbox.cleanup_error",
+          sandboxId,
+          reason: "retry",
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return { rescheduleAt: Date.now() + this.sandboxDestroyRetryBaseDelayMs() };
       }
     };
 
-    const tracked = run();
+    const promise = run();
+    const tracked = promise.then(
+      () => undefined,
+      () => undefined,
+    );
     this.#inflightCleanup = tracked;
-    tracked.finally(() => {
+    void tracked.then(() => {
       if (this.#inflightCleanup === tracked) {
         this.#inflightCleanup = null;
       }
     });
-    await tracked;
+    return promise;
+  }
+
+  #hasPendingDestroyJob(generation: number): boolean {
+    const existingJob = this.lifecycle.jobs.get(SANDBOX_CLEANUP_JOB_ID);
+    const existingPayload = parseCleanupJobPayload(existingJob?.payload);
+    return existingPayload?.pendingDestroy === true && existingPayload.generation === generation;
+  }
+
+  async #destroyWithTimeout(sandboxId: string): Promise<void> {
+    const timeoutMs = this.sandboxDestroyTimeoutMs();
+    const destroyPromise = this.env.RUNNER.destroy(sandboxId);
+    // タイムアウト後に遅れて reject された場合の unhandled rejection を防ぐ
+    destroyPromise.catch(() => {});
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        destroyPromise,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`sandbox destroy RPC timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    }
   }
 
   #hasDelivery(deliveryId: string): boolean {
