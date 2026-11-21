@@ -1,6 +1,7 @@
 export * from "./models.js";
 export * from "./node-project.js";
 export * from "./ports.js";
+export * from "./project.js";
 export * from "./tools/extension.js";
 export * from "./tools/findings.js";
 export * from "./tools/github.js";

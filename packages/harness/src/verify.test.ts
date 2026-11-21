@@ -418,4 +418,41 @@ describe("verifyCompletionClaim", () => {
       ],
     });
   });
+
+  it("Python / Go / Rust の検証コマンドを安全コマンドとして抽出し、未指定時はプロジェクトから自動検出する", async () => {
+    expect(
+      extractClaimCommands(
+        "`uv run --offline --no-sync pytest tests/test_app.py` と `.venv/bin/pytest` と `go vet ./...` と `cargo clippy --offline --all-targets` を実行した。",
+      ),
+    ).toEqual([
+      "uv run --offline --no-sync pytest tests/test_app.py",
+      ".venv/bin/pytest",
+      "go vet ./...",
+      "cargo clippy --offline --all-targets",
+    ]);
+
+    const py = createFakeSandbox({
+      files: {
+        "pyproject.toml": '[project]\nname = "app"\ndependencies = ["pytest", "ruff", "mypy"]\n',
+        "uv.lock": "version = 1\n",
+      },
+    });
+    const pyResult = await verifyCompletionClaim(py.sandbox, "テストがすべて通った。");
+    expect(pyResult.passed).toBe(true);
+    expect(py.executed).toEqual(["uv run --offline --no-sync pytest"]);
+
+    const go = createFakeSandbox({
+      files: { "go.mod": "module example.com/app\n\ngo 1.24\n" },
+    });
+    const goResult = await verifyCompletionClaim(go.sandbox, "テストと go vet がすべて通った。");
+    expect(goResult.passed).toBe(true);
+    expect(go.executed).toEqual(["go test ./...", "go vet ./..."]);
+
+    const rust = createFakeSandbox({
+      files: { "Cargo.toml": '[package]\nname = "core"\nversion = "0.1.0"\n' },
+    });
+    const rustResult = await verifyCompletionClaim(rust.sandbox, "テストがすべて通った。");
+    expect(rustResult.passed).toBe(true);
+    expect(rust.executed).toEqual(["cargo test --offline"]);
+  });
 });

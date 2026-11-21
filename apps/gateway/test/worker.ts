@@ -58,10 +58,10 @@ const GIT_FETCH_PATTERN =
   /GIT_TERMINAL_PROMPT=0\s+git\s+fetch\s+--depth\s+1\s+https:\/\/github\.com\/([^\s]+?)\.git\s+(?:--\s+)?([^\s&]+)/;
 
 const INSTALL_COMMAND_PATTERN =
-  /^(?:corepack\s+(?:npm|pnpm|yarn)@[0-9A-Za-z.-]+\s+|(?:npm|pnpm|yarn)\s+)(?:ci|install(?: --frozen-lockfile)?)$/;
+  /^(?:(?:corepack\s+(?:npm|pnpm|yarn)@[0-9A-Za-z.-]+\s+|(?:npm|pnpm|yarn)\s+)(?:ci|install(?: --frozen-lockfile)?)|uv\s+sync(?:\s+--frozen)?|uv\s+venv\s+\.venv(?:\s+&&\s+uv\s+pip\s+install\s+--python\s+\.venv\/bin\/python\s+.+)?|go\s+mod\s+download|cargo\s+fetch(?:\s+--locked)?)$/;
 
 const TEST_COMMAND_PATTERN =
-  /^(?:corepack\s+(?:npm|pnpm|yarn)@[0-9A-Za-z.-]+\s+|(?:npm|pnpm|yarn)\s+)(?:test|run\s+\S+)$/;
+  /^(?:(?:corepack\s+(?:npm|pnpm|yarn)@[0-9A-Za-z.-]+\s+|(?:npm|pnpm|yarn)\s+)(?:test|run\s+\S+)|uv\s+run(?:\s+(?:--offline|--no-sync))*\s+.+|\.venv\/bin\/(?:pytest|python\s+-m\s+unittest|ruff\s+check\s+\.|mypy\s+\.)|go\s+(?:test|vet)\s+\.\/\.\.\.|cargo\s+(?:test|clippy)\s+--offline.*)$/;
 
 /**
  * RUNNER service binding のテスト用 RPC 実装。
