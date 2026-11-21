@@ -355,4 +355,67 @@ describe("verifyCompletionClaim", () => {
 
     expect(executed).toEqual([]);
   });
+
+  it("検証コマンドがタイムアウトした場合は passed / reproduced いずれの宣言でも passed: false を返し、timeoutMs を転送する", async () => {
+    const execSpy = vi.fn(async (command: string, _options?: { readonly timeoutMs?: number }) => {
+      if (command === "pnpm test") {
+        return {
+          stdout: "running...",
+          stderr: "command timed out after 30000ms",
+          exitCode: 124,
+          timedOut: true,
+        };
+      }
+      return { stdout: "", stderr: "AssertionError", exitCode: 1 };
+    });
+    const sandbox: SandboxPort = {
+      listFiles: vi.fn(async () => []),
+      readFile: vi.fn(async () => ""),
+      writeFile: vi.fn(async () => {}),
+      exec: execSpy,
+    };
+
+    const passedClaim = await verifyCompletionClaim(
+      sandbox,
+      "`pnpm test` を実行してテストがすべて通った。",
+      { timeoutMs: 30_000 },
+    );
+    expect(passedClaim.passed).toBe(false);
+    expect(passedClaim.evidence).toContain(
+      'timeout: "pnpm test" exceeded the execution time limit',
+    );
+    expect(passedClaim.evidence.some((line) => line.includes("[timed out]"))).toBe(true);
+    expect(execSpy).toHaveBeenCalledWith("pnpm test", { timeoutMs: 30_000 });
+
+    // reproduced 期待でも、1 件でもタイムアウトしたコマンドがあれば fail-closed で passed: false
+    const reproducedClaim = await verifyCompletionClaim(
+      sandbox,
+      "`pnpm test` と `pnpm run check` で問題が再現した。",
+    );
+    expect(reproducedClaim.passed).toBe(false);
+    expect(reproducedClaim.evidence).toContain(
+      'timeout: "pnpm test" exceeded the execution time limit',
+    );
+  });
+
+  it("sandbox.exec が例外を投げた場合でも未捕捉例外にせず passed: false とエラー evidence を返す", async () => {
+    const sandbox: SandboxPort = {
+      listFiles: vi.fn(async () => []),
+      readFile: vi.fn(async () => ""),
+      writeFile: vi.fn(async () => {}),
+      exec: vi.fn(async () => {
+        throw new Error("container hard timeout");
+      }),
+    };
+
+    const result = await verifyCompletionClaim(sandbox, "`pnpm test` がすべて通った。");
+
+    expect(result).toEqual({
+      passed: false,
+      evidence: [
+        "claim expectation: passed",
+        'error: "pnpm test" failed to execute: container hard timeout',
+      ],
+    });
+  });
 });

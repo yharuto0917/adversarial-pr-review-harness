@@ -58,6 +58,13 @@ export async function setupNodeProject(sandbox: SandboxPort): Promise<NodeProjec
   const info = detectNodeProject(packageJsonContent, rootFiles);
   const result = await sandbox.exec(info.installCommand);
 
+  if (result.timedOut) {
+    const detail = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
+    throw new Error(
+      `timed out while installing dependencies with "${info.installCommand}" (exit ${result.exitCode})${detail ? `: ${detail}` : ""}`,
+    );
+  }
+
   if (result.exitCode !== 0) {
     const detail = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
     throw new Error(

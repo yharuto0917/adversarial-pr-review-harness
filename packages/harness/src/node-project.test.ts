@@ -207,4 +207,22 @@ describe("setupNodeProject", () => {
       'failed to install dependencies with "corepack pnpm@11.25.0 install --frozen-lockfile" (exit 1): ERR_PNPM_FETCH_404',
     );
   });
+
+  it("依存インストールがタイムアウトした場合はタイムアウトを示すエラーを投げる", async () => {
+    const sandbox: SandboxPort = {
+      listFiles: vi.fn(async () => ["package.json", "pnpm-lock.yaml"]),
+      readFile: vi.fn(async () => JSON.stringify({ name: "app" })),
+      writeFile: vi.fn(async () => {}),
+      exec: vi.fn(async () => ({
+        stdout: "",
+        stderr: "command timed out after 300000ms",
+        exitCode: 124,
+        timedOut: true,
+      })),
+    };
+
+    await expect(setupNodeProject(sandbox)).rejects.toThrow(
+      'timed out while installing dependencies with "pnpm install --frozen-lockfile" (exit 124): command timed out after 300000ms',
+    );
+  });
 });

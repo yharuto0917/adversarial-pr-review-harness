@@ -5,12 +5,24 @@ import type { ExecResult, SandboxExecOptions, SandboxService } from "@repo/harne
 import {
   CHECKOUT_EGRESS_TTL_MS,
   type CheckoutEgressParams,
+  type EgressPhase,
   handleOutboundRequest,
   INSTALL_EGRESS_TTL_MS,
   type InstallEgressParams,
   type LockedEgressParams,
   parseExtraAllowedHosts,
 } from "./egress.js";
+import {
+  CONTAINER_STARTUP_BUFFER_MS,
+  computeOuterTimeoutMs,
+  extractTimedOutResult,
+  resolveExecTimeoutMs,
+  TIMEOUT_KILL_GRACE_SECONDS,
+  wrapCommandWithTimeout,
+} from "./timeout.js";
+
+/** コンテナが無通信のまま放置された場合に自動スリープするまでの時間（最終安全ネット）。 */
+export const SANDBOX_SLEEP_AFTER = "10m";
 
 // 外向き HTTP/HTTPS インターセプトのために Worker エントリから再エクスポート必須
 export { ContainerProxy };
@@ -39,6 +51,7 @@ interface CheckoutAuthState {
 export class ReviewSandbox extends Sandbox<RunnerEnv> {
   override enableInternet = false;
   override interceptHttps = true;
+  override sleepAfter = SANDBOX_SLEEP_AFTER;
 
   /**
    * checkout 中のみ DO のオンメモリに一時保持する GitHub 認証ヘッダ。
@@ -50,6 +63,7 @@ export class ReviewSandbox extends Sandbox<RunnerEnv> {
   #activeLockedOps = 0;
   #exclusiveActive = false;
   #egressPoisoned = false;
+  #destroyEpoch = 0;
   readonly #exclusiveWaiters: Array<() => void> = [];
   readonly #lockedWaiters: Array<() => void> = [];
 
@@ -86,7 +100,7 @@ export class ReviewSandbox extends Sandbox<RunnerEnv> {
   }
 
   /**
-   * 外向き通信ポリシーと排他制御を伴ってコマンドを実行する。
+   * 外向き通信ポリシー・排他制御・実行時間上限を伴ってコマンドを実行する。
    * - `locked`（省略時含む）: 通常ゲート（排他フェーズ中は待機）で全遮断のまま実行する。
    * - `checkout` / `install`: 排他ゲートを取得し、TTL 付きポリシーを一時適用して実行後、
    *   成否に関わらず必ずオンメモリ認証を破棄して `locked` へ復帰する。
@@ -97,19 +111,33 @@ export class ReviewSandbox extends Sandbox<RunnerEnv> {
     logicalSandboxId?: string,
   ): Promise<ExecResult> {
     const egress = options?.egress;
+    const phase: EgressPhase = egress?.profile ?? "locked";
+    // 不正な timeoutMs でゲート待機やコンテナ破棄が走らないよう事前に検証・解決する
+    const timeoutMs = resolveExecTimeoutMs(phase, options?.timeoutMs);
+    // ゲート待機前に破棄世代を捕捉し、待機中に destroyGuarded() が走った場合の復活・egress 再開放を防ぐ
+    const entryEpoch = this.#destroyEpoch;
+
     if (!egress || egress.profile === "locked") {
-      return this.#withLockedGate(async () => {
-        const { stdout, stderr, exitCode } = await this.exec(command);
-        return { stdout, stderr, exitCode };
-      });
+      return this.#withLockedGate(entryEpoch, () =>
+        this.#execTimed(command, timeoutMs, entryEpoch, "locked"),
+      );
     }
 
     if (egress.profile === "checkout") {
-      return this.#withExclusiveGate(async () => {
+      return this.#withExclusiveGate(entryEpoch, "checkout", async () => {
         if (egress.resetContainer) {
           await this.destroy();
+          this.#assertNotDestroyedDuringPhase(entryEpoch, "checkout");
         }
-        const expiresAt = Date.now() + CHECKOUT_EGRESS_TTL_MS;
+        // resetContainer 時はコンテナのコールドスタート時間を挟むため、起動予算込みで TTL を確保する
+        // （完了・失敗時は finally で即時失効・locked 復帰されるため実効的な開放窓は増えない）
+        const egressTtlMs = egress.resetContainer
+          ? Math.max(
+              CHECKOUT_EGRESS_TTL_MS,
+              timeoutMs + CONTAINER_STARTUP_BUFFER_MS + TIMEOUT_KILL_GRACE_SECONDS * 1_000,
+            )
+          : CHECKOUT_EGRESS_TTL_MS;
+        const expiresAt = Date.now() + egressTtlMs;
         let tokenId: string | undefined;
         if (egress.githubToken !== undefined && egress.githubToken.length > 0) {
           tokenId = crypto.randomUUID();
@@ -128,8 +156,8 @@ export class ReviewSandbox extends Sandbox<RunnerEnv> {
         };
         try {
           await this.setOutboundHandler("checkout", params);
-          const { stdout, stderr, exitCode } = await this.exec(command);
-          return { stdout, stderr, exitCode };
+          this.#assertNotDestroyedDuringPhase(entryEpoch, "checkout");
+          return await this.#execTimed(command, timeoutMs, entryEpoch, "checkout");
         } finally {
           this.#checkoutAuth = null;
           await this.#resetToLocked(logicalSandboxId);
@@ -137,7 +165,7 @@ export class ReviewSandbox extends Sandbox<RunnerEnv> {
       });
     }
 
-    return this.#withExclusiveGate(async () => {
+    return this.#withExclusiveGate(entryEpoch, "install", async () => {
       const expiresAt = Date.now() + INSTALL_EGRESS_TTL_MS;
       const params: InstallEgressParams = {
         expiresAt,
@@ -145,33 +173,105 @@ export class ReviewSandbox extends Sandbox<RunnerEnv> {
       };
       try {
         await this.setOutboundHandler("install", params);
-        const { stdout, stderr, exitCode } = await this.exec(command);
-        return { stdout, stderr, exitCode };
+        this.#assertNotDestroyedDuringPhase(entryEpoch, "install");
+        return await this.#execTimed(command, timeoutMs, entryEpoch, "install");
       } finally {
         await this.#resetToLocked(logicalSandboxId);
       }
     });
   }
 
+  /**
+   * サンドボックスコンテナを安全に破棄する。
+   * `#egressPoisoned` 状態やハング中の排他フェーズでも破棄をブロックしないようゲートは経由せず、
+   * オンメモリ認証のクリアと `locked` 復帰試行の後に必ず `this.destroy()` を実行する。
+   */
+  async destroyGuarded(logicalSandboxId?: string): Promise<void> {
+    this.#destroyEpoch += 1;
+    this.#checkoutAuth = null;
+    const startedAt = Date.now();
+    let resetError: string | undefined;
+    try {
+      try {
+        await this.applyOutboundInterceptionPromise;
+        if (logicalSandboxId !== undefined) {
+          await this.setOutboundHandler("locked", {
+            logicalSandboxId,
+          } satisfies LockedEgressParams);
+        } else {
+          await this.setOutboundHandler("locked");
+        }
+      } catch (error) {
+        resetError = error instanceof Error ? error.message : String(error);
+      }
+      await this.destroy();
+      console.info({
+        event: "sandbox.lifecycle.destroy",
+        outcome: "success",
+        ...(logicalSandboxId !== undefined ? { logicalSandboxId } : {}),
+        ...(resetError !== undefined ? { resetError } : {}),
+        durationMs: Date.now() - startedAt,
+      });
+    } catch (error) {
+      console.error({
+        event: "sandbox.lifecycle.destroy",
+        outcome: "error",
+        ...(logicalSandboxId !== undefined ? { logicalSandboxId } : {}),
+        ...(resetError !== undefined ? { resetError } : {}),
+        durationMs: Date.now() - startedAt,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
+  async #execTimed(
+    command: string,
+    timeoutMs: number,
+    expectedEpoch?: number,
+    phase?: EgressPhase,
+  ): Promise<ExecResult> {
+    const nonce = crypto.randomUUID();
+    const wrapped = wrapCommandWithTimeout(command, timeoutMs, nonce);
+    const outerTimeoutMs = computeOuterTimeoutMs(timeoutMs);
+    const { stdout, stderr, exitCode } = await this.exec(wrapped, { timeout: outerTimeoutMs });
+    if (expectedEpoch !== undefined && phase !== undefined) {
+      this.#assertNotDestroyedDuringPhase(expectedEpoch, phase);
+    }
+    return extractTimedOutResult({ stdout, stderr, exitCode }, nonce, timeoutMs);
+  }
+
+  #assertNotDestroyedDuringPhase(expectedEpoch: number, phase: EgressPhase): void {
+    if (this.#destroyEpoch !== expectedEpoch) {
+      throw new Error(`sandbox was destroyed during ${phase} phase`);
+    }
+  }
+
   /** 排他フェーズ（checkout / install）と競合しないようゲート経由でファイルを読み取る。 */
   async readFileGuarded(path: string): Promise<string> {
-    return this.#withLockedGate(async () => {
+    const entryEpoch = this.#destroyEpoch;
+    return this.#withLockedGate(entryEpoch, async () => {
       const file = await this.readFile(path);
+      this.#assertNotDestroyedDuringPhase(entryEpoch, "locked");
       return file.content;
     });
   }
 
   /** 排他フェーズ（checkout / install）と競合しないようゲート経由でファイルを書き込む。 */
   async writeFileGuarded(path: string, content: string): Promise<void> {
-    await this.#withLockedGate(async () => {
+    const entryEpoch = this.#destroyEpoch;
+    await this.#withLockedGate(entryEpoch, async () => {
       await this.writeFile(path, content);
+      this.#assertNotDestroyedDuringPhase(entryEpoch, "locked");
     });
   }
 
   /** 排他フェーズ（checkout / install）と競合しないようゲート経由でファイル一覧を取得する。 */
   async listFilesGuarded(path: string): Promise<string[]> {
-    return this.#withLockedGate(async () => {
+    const entryEpoch = this.#destroyEpoch;
+    return this.#withLockedGate(entryEpoch, async () => {
       const listing = await this.listFiles(path);
+      this.#assertNotDestroyedDuringPhase(entryEpoch, "locked");
       return listing.files.map((file) => file.name);
     });
   }
@@ -217,8 +317,9 @@ export class ReviewSandbox extends Sandbox<RunnerEnv> {
     }
   }
 
-  async #withLockedGate<T>(fn: () => Promise<T>): Promise<T> {
+  async #withLockedGate<T>(entryEpoch: number, fn: () => Promise<T>): Promise<T> {
     this.#assertEgressHealthy();
+    this.#assertNotDestroyedDuringPhase(entryEpoch, "locked");
     if (this.#exclusiveActive || this.#exclusiveWaiters.length > 0) {
       await new Promise<void>((resolve) => {
         this.#lockedWaiters.push(resolve);
@@ -229,6 +330,7 @@ export class ReviewSandbox extends Sandbox<RunnerEnv> {
     try {
       this.#assertEgressHealthy();
       await this.applyOutboundInterceptionPromise;
+      this.#assertNotDestroyedDuringPhase(entryEpoch, "locked");
       return await fn();
     } finally {
       this.#activeLockedOps -= 1;
@@ -236,8 +338,13 @@ export class ReviewSandbox extends Sandbox<RunnerEnv> {
     }
   }
 
-  async #withExclusiveGate<T>(fn: () => Promise<T>): Promise<T> {
+  async #withExclusiveGate<T>(
+    entryEpoch: number,
+    phase: Extract<EgressPhase, "checkout" | "install">,
+    fn: () => Promise<T>,
+  ): Promise<T> {
     this.#assertEgressHealthy();
+    this.#assertNotDestroyedDuringPhase(entryEpoch, phase);
     if (this.#exclusiveActive || this.#activeLockedOps > 0) {
       await new Promise<void>((resolve) => {
         this.#exclusiveWaiters.push(resolve);
@@ -248,6 +355,7 @@ export class ReviewSandbox extends Sandbox<RunnerEnv> {
     try {
       this.#assertEgressHealthy();
       await this.applyOutboundInterceptionPromise;
+      this.#assertNotDestroyedDuringPhase(entryEpoch, phase);
       return await fn();
     } finally {
       this.#exclusiveActive = false;
@@ -415,6 +523,10 @@ export class SandboxEntrypoint extends WorkerEntrypoint<RunnerEnv> implements Sa
 
   async listFiles(sandboxId: string, path: string): Promise<string[]> {
     return this.#sandbox(sandboxId).listFilesGuarded(path);
+  }
+
+  async destroy(sandboxId: string): Promise<void> {
+    await this.#sandbox(sandboxId).destroyGuarded(sandboxId);
   }
 
   #sandbox(sandboxId: string) {

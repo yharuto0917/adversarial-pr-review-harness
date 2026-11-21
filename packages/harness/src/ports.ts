@@ -12,6 +12,8 @@ export interface ExecResult {
   readonly stdout: string;
   readonly stderr: string;
   readonly exitCode: number;
+  /** 実行時間の上限を超えて打ち切られたとき true。通常終了時は省略される。 */
+  readonly timedOut?: boolean;
 }
 
 /**
@@ -34,13 +36,19 @@ export type SandboxEgressPolicy =
     }
   | { readonly profile: "install" };
 
-export interface SandboxExecOptions {
+/** LLM ツール向け境界（`SandboxPort`）から指定可能な実行オプション。 */
+export interface SandboxPortExecOptions {
+  /** コマンド実行時間の上限（ミリ秒）。Runner 側でプロファイル別上限にクランプされる。 */
+  readonly timeoutMs?: number;
+}
+
+export interface SandboxExecOptions extends SandboxPortExecOptions {
   readonly egress?: SandboxEgressPolicy;
 }
 
 /** サンドボックス（fs / shell）への出口。 */
 export interface SandboxPort {
-  exec(command: string): Promise<ExecResult>;
+  exec(command: string, options?: SandboxPortExecOptions): Promise<ExecResult>;
   readFile(path: string): Promise<string>;
   writeFile(path: string, content: string): Promise<void>;
   listFiles(path: string): Promise<string[]>;
@@ -55,6 +63,7 @@ export interface SandboxService {
   readFile(sandboxId: string, path: string): Promise<string>;
   writeFile(sandboxId: string, path: string, content: string): Promise<void>;
   listFiles(sandboxId: string, path: string): Promise<string[]>;
+  destroy(sandboxId: string): Promise<void>;
 }
 
 /** GitHub への出口。 */
@@ -89,10 +98,18 @@ export function bindSandbox(
   defaultExecOptions?: SandboxExecOptions,
 ): SandboxPort {
   return {
-    exec: (command) =>
-      defaultExecOptions === undefined
-        ? service.exec(sandboxId, command)
-        : service.exec(sandboxId, command, defaultExecOptions),
+    exec: (command, options) => {
+      // SandboxPort 経由で egress が注入されないよう timeoutMs のみを明示的に取り出す
+      const timeoutMs = options?.timeoutMs ?? defaultExecOptions?.timeoutMs;
+      const egress = defaultExecOptions?.egress;
+      if (egress === undefined && timeoutMs === undefined) {
+        return service.exec(sandboxId, command);
+      }
+      return service.exec(sandboxId, command, {
+        ...(egress !== undefined ? { egress } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      });
+    },
     readFile: (path) => service.readFile(sandboxId, path),
     writeFile: (path, content) => service.writeFile(sandboxId, path, content),
     listFiles: (path) => service.listFiles(sandboxId, path),
