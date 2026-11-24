@@ -399,8 +399,56 @@ describe("ReviewOrchestrator", () => {
       expectedHint: "テストコマンドの候補: npm test, npm run test:unit",
       testCmd: "npm test",
     },
+    {
+      label: "Python (uv.lock)",
+      pullNumber: 905,
+      sha: "sha-py-uv",
+      files: {
+        "pyproject.toml": '[project]\nname = "py-app"\ndependencies = ["pytest"]\n',
+        "uv.lock": "version = 1\n",
+      },
+      expectedInstall: "uv sync --frozen",
+      expectedHint: "テストコマンドの候補: uv run --offline --no-sync pytest",
+      testCmd: "uv run --offline --no-sync pytest",
+    },
+    {
+      label: "Python (requirements.txt)",
+      pullNumber: 906,
+      sha: "sha-py-req",
+      files: {
+        "requirements.txt": "pytest==8.3.0\n",
+      },
+      expectedInstall:
+        "uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt",
+      expectedHint: "テストコマンドの候補: .venv/bin/pytest",
+      testCmd: ".venv/bin/pytest",
+    },
+    {
+      label: "Go (go.mod)",
+      pullNumber: 907,
+      sha: "sha-go",
+      files: {
+        "go.mod": "module example.com/app\n\ngo 1.24\n",
+      },
+      expectedInstall: "go mod download",
+      expectedHint: "テストコマンドの候補: go test ./..., go vet ./...",
+      testCmd: "go test ./...",
+    },
+    {
+      label: "Rust (Cargo.toml + Cargo.lock)",
+      pullNumber: 908,
+      sha: "sha-rust",
+      files: {
+        "Cargo.toml": '[package]\nname = "core"\nversion = "0.1.0"\n',
+        "Cargo.lock": "# lock\n",
+      },
+      expectedInstall: "cargo fetch --locked",
+      expectedHint:
+        "テストコマンドの候補: cargo test --offline, cargo clippy --offline --all-targets",
+      testCmd: "cargo test --offline",
+    },
   ])(
-    "Node プロジェクト ($label) で依存をインストールし、テストコマンド候補をモデルに示して exec からテストを実行できる",
+    "各エコシステムのプロジェクト ($label) で依存をインストールし、テストコマンド候補をモデルに示して exec からテストを実行できる",
     async ({ pullNumber, sha, files, expectedInstall, expectedHint, testCmd }) => {
       remoteRepoFiles.set(`octo/repo@${sha}`, files);
       const userPrompts: string[] = [];

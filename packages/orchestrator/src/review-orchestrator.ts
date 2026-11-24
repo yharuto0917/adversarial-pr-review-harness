@@ -11,7 +11,7 @@ import {
   parseModelRef,
   type SandboxPort,
   type SandboxService,
-  setupNodeProject,
+  setupProject,
 } from "@repo/harness";
 import { PiHarness, type PiOperationResult, type PiReceipt } from "agents/harness/pi";
 import { Lifecycle, type LifecycleJobContext, type LifecycleJobOutcome } from "agents/lifecycle";
@@ -466,7 +466,7 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
 
   /**
    * PR の head をサンドボックスのカレントディレクトリへチェックアウトし、
-   * Node プロジェクトであればパッケージマネージャを検出して依存をインストールする。
+   * 対応するエコシステム（Node.js / Python / Go / Rust）を検出して依存をインストールする。
    * アクティブな同一 head のサンドボックスが存在すれば再利用し、未作成・破棄済み・期限切れ・
    * head 更新時はコンテナを破棄して取り直す。
    * 最小権限（対象リポジトリ・contents: read）の installation token は runner の ContainerProxy
@@ -541,7 +541,7 @@ export class ReviewOrchestrator extends DurableObject<OrchestratorEnv> {
     const installSandbox = bindSandbox(this.env.RUNNER, sandboxId, {
       egress: { profile: "install" },
     });
-    const project = await setupNodeProject(installSandbox);
+    const project = await setupProject(installSandbox);
 
     const latest = this.#getTarget();
     if (!latest?.sandboxActive || latest.sandboxGeneration !== generation) {

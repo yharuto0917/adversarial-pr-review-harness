@@ -374,6 +374,13 @@ describe("evaluateEgressRequest", () => {
         "https://registry.npmjs.org/vitest/-/vitest-4.1.0.tgz",
         "https://registry.yarnpkg.com/lodash",
         "https://repo.yarnpkg.com/4.5.0/packages/yarnpkg-cli/bin/yarn.js",
+        "https://pypi.org/simple/pytest/",
+        "https://files.pythonhosted.org/packages/source/p/pytest/pytest-8.3.0.tar.gz",
+        "https://proxy.golang.org/github.com/google/go-cmp/@v/list",
+        "https://sum.golang.org/lookup/github.com/google/go-cmp@v0.6.0",
+        "https://index.crates.io/se/rd/serde",
+        "https://static.crates.io/crates/serde/serde-1.0.210.crate",
+        "https://crates.io/api/v1/crates/serde/1.0.210/download",
         "https://npm.corp.example/@corp%2fpkg",
       ]) {
         const res = evaluateEgressRequest(new Request(url, { method: "GET" }), installPolicy, {
