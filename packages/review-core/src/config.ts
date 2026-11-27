@@ -80,6 +80,40 @@ export const modelRefSchema = z
   });
 export type ModelRefString = z.infer<typeof modelRefSchema>;
 
+/**
+ * `opencode` プロバイダのフラットなモデル ID（ベンダー区切りなし）から実ベンダーを推定する規則。
+ * `@earendil-works/pi-ai` の `opencode.json` 収録モデル体系に準拠する。
+ */
+const OPENCODE_MODEL_VENDOR_RULES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^claude(?:-|$)/, "anthropic"],
+  [/^(?:gemini|gemma)(?:-|$)/, "google"],
+  [/^(?:gpt-|chatgpt-|o[134](?:-|$))/, "openai"],
+  [/^deepseek(?:-|$)/, "deepseek"],
+  [/^glm(?:-|$)/, "z-ai"],
+  [/^grok(?:-|$)/, "x-ai"],
+  [/^kimi(?:-|$)/, "moonshotai"],
+  [/^minimax(?:-|$)/, "minimax"],
+  [/^mistral(?:-|$)/, "mistralai"],
+  [/^nemotron(?:-|$)/, "nvidia"],
+  [/^qwen(?:[-0-9]|$)/, "qwen"],
+  [/^mimo(?:-|$)/, "xiaomi"],
+  [/^step(?:-|$)/, "stepfun"],
+  [/^longcat(?:-|$)/, "meituan"],
+  [/^ling(?:-|$)/, "inclusionai"],
+  [/^llama(?:-|$)/, "meta"],
+];
+
+/** 同一実ベンダーの表記ゆれ（例: `meta-llama` と `meta`）を統一する。 */
+const VENDOR_ALIASES: Readonly<Record<string, string>> = {
+  "meta-llama": "meta",
+  mistral: "mistralai",
+};
+
+function normalizeVendorName(rawVendor: string): string {
+  const lower = rawVendor.trim().toLowerCase();
+  return VENDOR_ALIASES[lower] ?? lower;
+}
+
 /** `<provider>/<model-id>` から先頭のプロバイダ名を取り出す（小文字正規化）。不正形式は例外を送出する。 */
 export function extractModelProvider(modelRef: string): string {
   const trimmed = modelRef.trim();
@@ -90,21 +124,41 @@ export function extractModelProvider(modelRef: string): string {
 }
 
 /**
- * アグリゲータプロバイダ（`openrouter/<vendor>/<model>` 等）を考慮して実ベンダーを抽出する（小文字正規化）。
- * `openrouter/google/gemini-4-neon` や `OpenRouter/Google/...` を `google` として扱い、同一ベンダー制約迂回を防ぐ。
+ * 中継プロバイダ（`openrouter` / `opencode`）を考慮して実ベンダーを抽出する（小文字正規化）。
+ *
+ * - `openrouter/<vendor>/<model>` および `openrouter/~<vendor>/<model>`: 先頭 `~` を除去した `<vendor>` を返す。
+ *   `openrouter/auto` や `openrouter/openrouter/...` など実ベンダーを特定できない ID は `null` を返す。
+ * - `opencode/<model>`: `<vendor>/<model>` 形式なら `openrouter` と同様に抽出し、
+ *   フラット ID（`claude-opus-5`, `gpt-6-sol`, `gemini-3.5-flash` 等）は接頭辞対応表で実ベンダーを推定する。
+ *   推定不能な ID（`big-pickle` 等）は fail-closed として `null` を返す。
  */
-export function extractEffectiveVendor(modelRef: string): string {
+export function extractEffectiveVendor(modelRef: string): string | null {
   const trimmed = modelRef.trim();
   const provider = extractModelProvider(trimmed);
   if (!AGGREGATOR_PROVIDERS.has(provider)) {
-    return provider;
+    return normalizeVendorName(provider);
   }
-  const modelId = trimmed.slice(provider.length + 1);
+
+  const modelId = trimmed.slice(provider.length + 1).toLowerCase();
   const nestedSlash = modelId.indexOf("/");
   if (nestedSlash > 0) {
-    return modelId.slice(0, nestedSlash).toLowerCase();
+    const strippedVendor = modelId.slice(0, nestedSlash).replace(/^~+/, "");
+    if (strippedVendor.length === 0 || AGGREGATOR_PROVIDERS.has(strippedVendor)) {
+      return null;
+    }
+    return normalizeVendorName(strippedVendor);
   }
-  return provider;
+
+  if (provider === "opencode") {
+    const normalizedId = modelId.replace(/^~+/, "");
+    for (const [pattern, vendor] of OPENCODE_MODEL_VENDOR_RULES) {
+      if (pattern.test(normalizedId)) {
+        return normalizeVendorName(vendor);
+      }
+    }
+  }
+
+  return null;
 }
 
 /** 重複・自己検証判定用の正規化キー（大小文字違いでのバイパスを防ぐ）。 */
@@ -118,26 +172,43 @@ export interface DuplicateVendorGroup {
 }
 
 export interface ProviderDiversityAnalysis {
-  readonly mainVendor: string;
+  readonly mainVendor: string | null;
   readonly hasCrossProviderVerifier: boolean;
   readonly sameVendorAsMainModels: readonly string[];
+  readonly undeterminedVendorModels: readonly string[];
   readonly duplicateVendorGroups: readonly DuplicateVendorGroup[];
   readonly warnings: readonly string[];
 }
 
-/** Main モデルと Verifier モデル群のプロバイダ／実ベンダー多様性を診断する。 */
+/**
+ * Main モデルと Verifier モデル群のプロバイダ／実ベンダー多様性を診断する。
+ * 実ベンダーを判定できない中継モデル（`vendor === null`）は fail-closed で同一ベンダー扱いとする。
+ */
 export function analyzeProviderDiversity(
   mainModel: string,
   verifierModels: readonly string[],
 ): ProviderDiversityAnalysis {
   const mainVendor = extractEffectiveVendor(mainModel);
   const sameVendorAsMainModels: string[] = [];
+  const undeterminedVendorModels: string[] = [];
   const modelsByVendor = new Map<string, string[]>();
 
+  if (mainVendor === null) {
+    undeterminedVendorModels.push(mainModel);
+  }
+
+  let hasCrossProviderVerifier = false;
   for (const model of verifierModels) {
     const vendor = extractEffectiveVendor(model);
-    if (vendor === mainVendor) {
+    if (vendor === null) {
+      undeterminedVendorModels.push(model);
       sameVendorAsMainModels.push(model);
+      continue;
+    }
+    if (mainVendor === null || vendor === mainVendor) {
+      sameVendorAsMainModels.push(model);
+    } else {
+      hasCrossProviderVerifier = true;
     }
     const group = modelsByVendor.get(vendor);
     if (group !== undefined) {
@@ -147,9 +218,6 @@ export function analyzeProviderDiversity(
     }
   }
 
-  const hasCrossProviderVerifier = verifierModels.some(
-    (model) => extractEffectiveVendor(model) !== mainVendor,
-  );
   const duplicateVendorGroups: DuplicateVendorGroup[] = [];
   for (const [vendor, models] of modelsByVendor) {
     if (models.length > 1) {
@@ -158,13 +226,19 @@ export function analyzeProviderDiversity(
   }
 
   const warnings: string[] = [];
-  if (!hasCrossProviderVerifier) {
+  if (undeterminedVendorModels.length > 0) {
     warnings.push(
-      `all verifierModels share the same vendor "${mainVendor}" as mainModel "${mainModel}"`,
+      `could not determine effective vendor for aggregator model(s) (treated as same-vendor): ${undeterminedVendorModels.join(", ")}`,
+    );
+  }
+  if (!hasCrossProviderVerifier) {
+    const vendorLabel = mainVendor ?? "unknown";
+    warnings.push(
+      `no verifierModel is provably from a different vendor than mainModel "${mainModel}" (vendor: "${vendorLabel}")`,
     );
   } else if (sameVendorAsMainModels.length > 0) {
     warnings.push(
-      `verifierModels includes model(s) from the same vendor "${mainVendor}" as mainModel: ${sameVendorAsMainModels.join(", ")}`,
+      `verifierModels includes model(s) from the same/undetermined vendor as mainModel "${mainModel}": ${sameVendorAsMainModels.join(", ")}`,
     );
   }
   for (const group of duplicateVendorGroups) {
@@ -177,6 +251,7 @@ export function analyzeProviderDiversity(
     mainVendor,
     hasCrossProviderVerifier,
     sameVendorAsMainModels,
+    undeterminedVendorModels,
     duplicateVendorGroups,
     warnings,
   };
@@ -230,7 +305,7 @@ export const repoReviewConfigSchema = z
       ctx.addIssue({
         code: "custom",
         path: ["verifierModels"],
-        message: `verifierModels must include at least one model from a different provider/vendor than mainModel "${data.mainModel}" (vendor: "${diversity.mainVendor}")`,
+        message: `verifierModels must include at least one model from a provably different provider/vendor than mainModel "${data.mainModel}" (vendor: "${diversity.mainVendor ?? "unknown"}")`,
       });
     }
 
@@ -403,7 +478,7 @@ function validatePolicy(policy: AdminReviewConfigPolicy | undefined): {
         : undefined,
     allowedProviders:
       policy.allowedProviders !== undefined
-        ? new Set(policy.allowedProviders.map((p) => p.trim().toLowerCase()))
+        ? new Set(policy.allowedProviders.map((p) => normalizeVendorName(p)))
         : undefined,
     maxBudgetUsd: policy.maxBudgetUsd,
     maxIterationsCap: policy.maxIterationsCap,
@@ -421,9 +496,9 @@ function isModelAllowedByPolicy(
     return false;
   }
   if (allowedProviders !== undefined) {
-    const provider = extractModelProvider(modelRef);
+    const provider = normalizeVendorName(extractModelProvider(modelRef));
     const vendor = extractEffectiveVendor(modelRef);
-    if (!allowedProviders.has(provider) || !allowedProviders.has(vendor)) {
+    if (vendor === null || !allowedProviders.has(provider) || !allowedProviders.has(vendor)) {
       return false;
     }
   }
@@ -440,9 +515,15 @@ function clampVerifiersPreservingDiversity(
     return [...verifierModels];
   }
   const mainVendor = extractEffectiveVendor(mainModel);
-  const crossVendor = verifierModels.filter((m) => extractEffectiveVendor(m) !== mainVendor);
-  const sameVendor = verifierModels.filter((m) => extractEffectiveVendor(m) === mainVendor);
-  return [...crossVendor, ...sameVendor].slice(0, maxVerifiersCap);
+  const crossVendor = verifierModels.filter((m) => {
+    const vendor = extractEffectiveVendor(m);
+    return mainVendor !== null && vendor !== null && vendor !== mainVendor;
+  });
+  const sameOrUndeterminedVendor = verifierModels.filter((m) => {
+    const vendor = extractEffectiveVendor(m);
+    return mainVendor === null || vendor === null || vendor === mainVendor;
+  });
+  return [...crossVendor, ...sameOrUndeterminedVendor].slice(0, maxVerifiersCap);
 }
 
 /**

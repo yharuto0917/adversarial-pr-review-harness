@@ -23,9 +23,21 @@ describe("modelRefSchema / プロバイダ・実ベンダー抽出", () => {
     expect(extractModelProvider("openrouter/google/gemini-4-neon")).toBe("openrouter");
     expect(extractEffectiveVendor("openrouter/google/gemini-4-neon")).toBe("google");
     expect(extractEffectiveVendor("OpenRouter/Google/gemini-4-neon")).toBe("google");
+    expect(extractEffectiveVendor("openrouter/~google/gemini-4-neon")).toBe("google");
+    expect(extractEffectiveVendor("openrouter/~anthropic/claude-sonnet-5.5")).toBe("anthropic");
+    expect(extractEffectiveVendor("openrouter/auto")).toBeNull();
+    expect(extractEffectiveVendor("openrouter/openrouter/free")).toBeNull();
     expect(extractModelProvider("Google/gemini-4-neon")).toBe("google");
     expect(extractEffectiveVendor("openrouter/anthropic/claude-sonnet-5.5")).toBe("anthropic");
-    expect(extractEffectiveVendor("opencode/gpt-6.2-sol")).toBe("opencode");
+    expect(extractEffectiveVendor("opencode/gpt-6.2-sol")).toBe("openai");
+    expect(extractEffectiveVendor("opencode/claude-opus-5")).toBe("anthropic");
+    expect(extractEffectiveVendor("opencode/gemini-3.8-flash")).toBe("google");
+    expect(extractEffectiveVendor("opencode/deepseek-v4-pro")).toBe("deepseek");
+    expect(extractEffectiveVendor("opencode/grok-4.7")).toBe("x-ai");
+    expect(extractEffectiveVendor("opencode/kimi-k3")).toBe("moonshotai");
+    expect(extractEffectiveVendor("opencode/qwen3.8-max")).toBe("qwen");
+    expect(extractEffectiveVendor("opencode/big-pickle")).toBeNull();
+    expect(extractEffectiveVendor("opencode/unknown-custom-model")).toBeNull();
   });
 
   it.each([
@@ -65,7 +77,7 @@ describe("repoReviewConfigSchema", () => {
       }).success,
     ).toBe(false);
 
-    // アグリゲータ経由の同一ベンダー迂回（大文字混在含む）も拒否
+    // アグリゲータ経由の同一ベンダー迂回（大文字混在・openrouter ~ 付き・opencode フラット ID・未知 ID）を拒否
     expect(
       repoReviewConfigSchema.safeParse({
         ...DEFAULT_REPO_REVIEW_CONFIG,
@@ -78,6 +90,56 @@ describe("repoReviewConfigSchema", () => {
         ...DEFAULT_REPO_REVIEW_CONFIG,
         mainModel: "google/gemini-4-neon",
         verifierModels: ["OpenRouter/Google/gemini-4-neon"],
+      }).success,
+    ).toBe(false);
+    expect(
+      repoReviewConfigSchema.safeParse({
+        ...DEFAULT_REPO_REVIEW_CONFIG,
+        mainModel: "google/gemini-4-neon",
+        verifierModels: ["openrouter/~google/gemini-4-neon"],
+      }).success,
+    ).toBe(false);
+    expect(
+      repoReviewConfigSchema.safeParse({
+        ...DEFAULT_REPO_REVIEW_CONFIG,
+        mainModel: "anthropic/claude-sonnet-5.5",
+        verifierModels: ["opencode/claude-opus-5"],
+      }).success,
+    ).toBe(false);
+    expect(
+      repoReviewConfigSchema.safeParse({
+        ...DEFAULT_REPO_REVIEW_CONFIG,
+        mainModel: "anthropic/claude-sonnet-5.5",
+        verifierModels: ["openrouter/~anthropic/claude-opus-5"],
+      }).success,
+    ).toBe(false);
+    expect(
+      repoReviewConfigSchema.safeParse({
+        ...DEFAULT_REPO_REVIEW_CONFIG,
+        mainModel: "google/gemini-4-neon",
+        verifierModels: ["opencode/gemini-3.5-flash", "openrouter/~google/gemini-3.8-flash"],
+      }).success,
+    ).toBe(false);
+    // 実ベンダー判定不能な中継 ID は同一ベンダーとみなして拒否
+    expect(
+      repoReviewConfigSchema.safeParse({
+        ...DEFAULT_REPO_REVIEW_CONFIG,
+        mainModel: "google/gemini-4-neon",
+        verifierModels: ["opencode/big-pickle"],
+      }).success,
+    ).toBe(false);
+    expect(
+      repoReviewConfigSchema.safeParse({
+        ...DEFAULT_REPO_REVIEW_CONFIG,
+        mainModel: "google/gemini-4-neon",
+        verifierModels: ["openrouter/auto"],
+      }).success,
+    ).toBe(false);
+    expect(
+      repoReviewConfigSchema.safeParse({
+        ...DEFAULT_REPO_REVIEW_CONFIG,
+        mainModel: "opencode/big-pickle",
+        verifierModels: ["openai/gpt-6.2-sol"],
       }).success,
     ).toBe(false);
 
@@ -248,15 +310,48 @@ describe("mergeRepoReviewConfig", () => {
     expect(emptyAllowlist.config.mainModel).toBe(DEFAULT_MAIN_MODEL);
     expect(emptyAllowlist.config.verifierModels).toEqual([...DEFAULT_VERIFIER_MODELS]);
 
-    // allowedProviders が実ベンダーも検査し openrouter/google/... を弾く
+    // allowedProviders が実ベンダーも検査し openrouter/google/...・openrouter/~google/...・opencode/claude-...・未知 ID を弾く
     const aggregatorBypass = mergeRepoReviewConfig(
       {},
       {
-        verifierModels: ["openrouter/google/gemini-4-neon", "openai/gpt-6.1-sol"],
+        verifierModels: [
+          "openrouter/google/gemini-4-neon",
+          "openrouter/~google/gemini-3.5-flash",
+          "opencode/claude-opus-5",
+          "opencode/big-pickle",
+          "opencode/gpt-6.1-sol",
+        ],
       },
-      { allowRepoModelOverride: true, allowedProviders: ["openrouter", "openai"] },
+      { allowRepoModelOverride: true, allowedProviders: ["openrouter", "opencode", "openai"] },
     );
-    expect(aggregatorBypass.config.verifierModels).toEqual(["openai/gpt-6.1-sol"]);
+    expect(aggregatorBypass.config.verifierModels).toEqual(["opencode/gpt-6.1-sol"]);
+
+    // 既定 Google 主モデルに対し Google 系中継モデル 2 件を宣言しても拒否し管理ストア値へ戻す
+    const googleRelaySelfApprove = mergeRepoReviewConfig(
+      {},
+      {
+        verifierModels: ["opencode/gemini-3.5-flash", "openrouter/~google/gemini-3.8-flash"],
+      },
+      { allowRepoModelOverride: true },
+    );
+    expect(googleRelaySelfApprove.config.verifierModels).toEqual([...DEFAULT_VERIFIER_MODELS]);
+    expect(
+      googleRelaySelfApprove.clampedFields.filter((c) => c.field === "verifierModels"),
+    ).toHaveLength(1);
+    expect(googleRelaySelfApprove.warnings.length).toBeGreaterThan(0);
+
+    // allowedProviders に opencode 単体のみ許可しても配下の全ベンダーは許可しない
+    const opencodeOnlyAllowlist = mergeRepoReviewConfig(
+      {},
+      {
+        verifierModels: ["opencode/claude-opus-5", "opencode/gpt-6-sol"],
+      },
+      { allowRepoModelOverride: true, allowedProviders: ["opencode"] },
+    );
+    expect(opencodeOnlyAllowlist.config.verifierModels).toEqual([...DEFAULT_VERIFIER_MODELS]);
+    expect(opencodeOnlyAllowlist.clampedFields.some((c) => c.field === "verifierModels")).toBe(
+      true,
+    );
 
     // 片側上書き（mainModel のみ変更）で管理側 verifier と自己衝突したらペアごと管理値へ戻す
     const oneSideCollision = mergeRepoReviewConfig(
