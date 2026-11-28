@@ -8,6 +8,7 @@ import {
   fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
 import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
+import type { ExecutionMode } from "@repo/review-core";
 import { describe, expect, it } from "vitest";
 
 import type {
@@ -17,7 +18,7 @@ import type {
   SandboxPortExecOptions,
   SandboxService,
 } from "../ports.js";
-import { bindSandbox } from "../ports.js";
+import { bindSandbox, guardSandboxPort, StaticOnlyPolicyError } from "../ports.js";
 import { createReviewExtension } from "./extension.js";
 
 const context = BACKGROUND_CONTEXT;
@@ -43,14 +44,37 @@ function fakePorts(execResult?: ExecResult) {
       listFiles: async () => [],
     },
     github: {
+      getPullRequestMeta: async () => ({
+        number: 1,
+        state: "open",
+        draft: false,
+        title: "Test PR",
+        body: null,
+        authorLogin: "alice",
+        baseSha: "base1",
+        headSha: "head1",
+        baseRef: "main",
+        headRef: "feat/x",
+        defaultBranch: "main",
+        baseRepoId: 1,
+        headRepoId: 1,
+        baseRepoFullName: "octo/repo",
+        headRepoFullName: "octo/repo",
+        isFork: false,
+      }),
       getDiff: async () => {
         calls.push("getDiff");
         return "diff --git a/src/sum.ts b/src/sum.ts";
       },
-      postReview: async (body) => {
-        calls.push(`postReview ${body}`);
-      },
-      resolveThread: async () => {},
+      listPullRequestFiles: async () => ({ files: [], truncated: false }),
+      getCommitChecks: async (headSha) => ({
+        headSha,
+        checks: [],
+        checkSuites: [],
+        truncated: false,
+      }),
+      listReviewThreads: async () => ({ threads: [], truncated: false }),
+      getFileContent: async () => null,
     },
     findings: {
       report: async (finding) => {
@@ -62,14 +86,20 @@ function fakePorts(execResult?: ExecResult) {
 }
 
 /** 台本どおりに応答する擬似モデルで、レビュー拡張を載せた Pi のループを 1 回走らせる。 */
-async function runReview(responses: FauxResponseStep[], execResult?: ExecResult) {
-  const fakes = fakePorts(execResult);
+async function runReview(
+  responses: FauxResponseStep[],
+  options?: { readonly execResult?: ExecResult; readonly executionMode?: ExecutionMode },
+) {
+  const fakes = fakePorts(options?.execResult);
   const faux = fauxProvider();
   faux.setResponses(responses);
   const models = createModels();
   models.setProvider(faux.provider);
   const registry = createRegistry();
-  registry.install(createReviewExtension(fakes.ports));
+  const extension = createReviewExtension(fakes.ports, {
+    ...(options?.executionMode !== undefined ? { executionMode: options.executionMode } : {}),
+  });
+  registry.install(extension);
 
   const harness = await Harness.open(new MemoryStorage(), { models, registry }, context);
   const model = faux.getModel();
@@ -80,15 +110,21 @@ async function runReview(responses: FauxResponseStep[], execResult?: ExecResult)
   const settled = await submission.wait(context);
   await harness.close(context);
 
-  return { ...fakes, settled, pendingResponses: faux.getPendingResponseCount() };
+  const registeredToolNames = (extension.tools ?? []).map((t) => t.name);
+  return {
+    ...fakes,
+    settled,
+    registeredToolNames,
+    pendingResponses: faux.getPendingResponseCount(),
+  };
 }
 
 const toolCall = (name: string, args: Parameters<typeof fauxToolCall>[1]) =>
   fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
 
 describe("createReviewExtension", () => {
-  it("Pi のループからツールが呼ばれ、指摘が FindingsPort に届く", async () => {
-    const { calls, reported, settled, pendingResponses } = await runReview([
+  it("Pi のループから Read 専用 GitHub ツール・Sandbox・Findings が呼ばれ、post_review / resolve_thread は登録されない", async () => {
+    const { calls, reported, settled, registeredToolNames, pendingResponses } = await runReview([
       toolCall("get_diff", {}),
       toolCall("exec", { command: "pnpm test" }),
       toolCall("report_finding", {
@@ -98,12 +134,14 @@ describe("createReviewExtension", () => {
         title: "空配列で例外になる",
         body: "pnpm test が 1 件失敗する。",
       }),
-      toolCall("post_review", { body: "1 件の問題を確認" }),
       fauxAssistantMessage(fauxText("レビュー完了")),
     ]);
 
     expect(settled.status).toBe("done");
-    expect(calls).toEqual(["getDiff", "exec pnpm test", "postReview 1 件の問題を確認"]);
+    expect(calls).toEqual(["getDiff", "exec pnpm test"]);
+    expect(registeredToolNames).toContain("get_diff");
+    expect(registeredToolNames).not.toContain("post_review");
+    expect(registeredToolNames).not.toContain("resolve_thread");
     expect(reported).toEqual([
       {
         path: "src/sum.ts",
@@ -114,6 +152,20 @@ describe("createReviewExtension", () => {
       },
     ]);
     expect(pendingResponses).toBe(0);
+  });
+
+  it("executionMode=static_only では exec と write_file がツール登録から除外される", async () => {
+    const { registeredToolNames } = await runReview(
+      [fauxAssistantMessage(fauxText("静的レビュー完了"))],
+      { executionMode: "static_only" },
+    );
+
+    expect(registeredToolNames).toContain("get_diff");
+    expect(registeredToolNames).toContain("read_file");
+    expect(registeredToolNames).toContain("list_files");
+    expect(registeredToolNames).toContain("report_finding");
+    expect(registeredToolNames).not.toContain("exec");
+    expect(registeredToolNames).not.toContain("write_file");
   });
 
   it("行番号を省いた指摘は line: null として記録する", async () => {
@@ -165,10 +217,12 @@ describe("createReviewExtension", () => {
         },
       ],
       {
-        stdout: "partial",
-        stderr: "command timed out after 45000ms",
-        exitCode: 124,
-        timedOut: true,
+        execResult: {
+          stdout: "partial",
+          stderr: "command timed out after 45000ms",
+          exitCode: 124,
+          timedOut: true,
+        },
       },
     );
 
@@ -183,7 +237,7 @@ describe("createReviewExtension", () => {
   });
 });
 
-describe("bindSandbox", () => {
+describe("bindSandbox / guardSandboxPort", () => {
   it("SandboxPort 経由の実行時オブジェクトに egress が混入しても timeoutMs だけを転送し egress を上書きさせない", async () => {
     const serviceCalls: Array<{
       readonly sandboxId: string;
@@ -223,5 +277,42 @@ describe("bindSandbox", () => {
         argCount: 3,
       },
     ]);
+  });
+
+  it("guardSandboxPort は実行モードの動的切替に応じて exec / writeFile を StaticOnlyPolicyError で遮断する", async () => {
+    const rawCalls: string[] = [];
+    let mode: ExecutionMode = "full";
+    const guarded = guardSandboxPort(
+      {
+        exec: async (cmd) => {
+          rawCalls.push(`exec:${cmd}`);
+          return { stdout: "", stderr: "", exitCode: 0 };
+        },
+        readFile: async (path) => {
+          rawCalls.push(`read:${path}`);
+          return "ok";
+        },
+        writeFile: async (path) => {
+          rawCalls.push(`write:${path}`);
+        },
+        listFiles: async (path) => {
+          rawCalls.push(`list:${path}`);
+          return [];
+        },
+      },
+      () => mode,
+      () => "fork_pr",
+    );
+
+    await guarded.exec("pnpm test");
+    await guarded.writeFile("a.txt", "1");
+
+    mode = "static_only";
+    await expect(guarded.exec("pnpm test")).rejects.toThrow(StaticOnlyPolicyError);
+    await expect(guarded.writeFile("a.txt", "2")).rejects.toThrow(StaticOnlyPolicyError);
+    await expect(guarded.readFile("src/a.ts")).resolves.toBe("ok");
+    await expect(guarded.listFiles(".")).resolves.toEqual([]);
+
+    expect(rawCalls).toEqual(["exec:pnpm test", "write:a.txt", "read:src/a.ts", "list:."]);
   });
 });

@@ -7,7 +7,9 @@ import {
   fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
 import { clearInstallationTokenCache } from "@repo/github";
-import { VAULT_INSTANCE_NAME } from "@repo/orchestrator";
+import type { GitHubWritePort } from "@repo/harness";
+import { StaticOnlyPolicyError } from "@repo/harness";
+import { type ReviewRequest, VAULT_INSTANCE_NAME } from "@repo/orchestrator";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -32,6 +34,167 @@ const request = {
   installationId: 42,
 };
 
+interface MockCheckRun {
+  readonly id: number;
+  readonly name: string;
+  readonly status: "queued" | "in_progress" | "completed";
+  readonly conclusion: "success" | "failure" | "timed_out" | "skipped" | "action_required" | null;
+  readonly summary?: string;
+}
+
+const mockGitHub = {
+  headSha: "abc123",
+  baseSha: "base000",
+  defaultBranch: "main",
+  isFork: false,
+  diff: "diff --git a/src/sum.ts b/src/sum.ts\n--- a/src/sum.ts\n+++ b/src/sum.ts\n@@ -1,1 +1,2 @@\n export const a = 1;\n+export const b = 2;\n",
+  filesByRef: new Map<string, string>(),
+  checkRunsBySha: new Map<string, readonly MockCheckRun[]>(),
+  defaultPassingCi: true,
+  tokenRequestBodies: [] as Array<string | undefined>,
+  requestedContentRefs: [] as Array<{ readonly path: string; readonly ref: string }>,
+};
+
+function installMockGitHubFetch(): void {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const accept = new Headers(init?.headers).get("Accept") ?? "";
+
+      if (url.endsWith("/app/installations/42/access_tokens")) {
+        mockGitHub.tokenRequestBodies.push(typeof init?.body === "string" ? init.body : undefined);
+        const expiresAt = new Date(Date.now() + 3600_000).toISOString();
+        return Response.json({ token: "ghs_inst_42", expires_at: expiresAt }, { status: 201 });
+      }
+
+      const prMatch = /\/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)$/.exec(url);
+      if (prMatch) {
+        const repo = prMatch[1] ?? "octo/repo";
+        const pullNum = Number(prMatch[2]);
+        if (accept.includes("v3.diff")) {
+          return new Response(mockGitHub.diff, { status: 200 });
+        }
+        return Response.json({
+          number: pullNum,
+          state: "open",
+          draft: false,
+          title: `PR #${pullNum}`,
+          body: null,
+          user: { login: "alice" },
+          base: {
+            sha: mockGitHub.baseSha,
+            ref: mockGitHub.defaultBranch,
+            repo: { id: 100, full_name: repo, default_branch: mockGitHub.defaultBranch },
+          },
+          head: {
+            sha: mockGitHub.headSha,
+            ref: "feat/x",
+            repo: mockGitHub.isFork
+              ? { id: 200, full_name: "external/repo", default_branch: mockGitHub.defaultBranch }
+              : { id: 100, full_name: repo, default_branch: mockGitHub.defaultBranch },
+          },
+        });
+      }
+
+      if (url.includes("/compare/")) {
+        return new Response(mockGitHub.diff, { status: 200 });
+      }
+
+      if (url.includes("/pulls/") && url.includes("/files")) {
+        return Response.json([
+          { filename: "src/sum.ts", status: "modified", additions: 1, deletions: 0, changes: 1 },
+        ]);
+      }
+
+      const contentMatch = /\/contents\/([^?]+)\?ref=(.+)$/.exec(url);
+      if (contentMatch) {
+        const path = decodeURIComponent(contentMatch[1] ?? "");
+        const ref = decodeURIComponent(contentMatch[2] ?? "");
+        mockGitHub.requestedContentRefs.push({ path, ref });
+        const content = mockGitHub.filesByRef.get(`${ref}:${path}`);
+        if (content === undefined) {
+          return new Response("Not Found", { status: 404 });
+        }
+        return Response.json({
+          type: "file",
+          encoding: "base64",
+          size: Buffer.byteLength(content, "utf-8"),
+          content: Buffer.from(content, "utf-8").toString("base64"),
+        });
+      }
+
+      const checkRunsMatch = /\/commits\/([^/?]+)\/check-runs/.exec(url);
+      if (checkRunsMatch) {
+        const sha = decodeURIComponent(checkRunsMatch[1] ?? "");
+        const configured = mockGitHub.checkRunsBySha.get(sha);
+        const runs =
+          configured !== undefined
+            ? configured
+            : mockGitHub.defaultPassingCi
+              ? [
+                  {
+                    id: 101,
+                    name: "CI / test",
+                    status: "completed" as const,
+                    conclusion: "success" as const,
+                  },
+                ]
+              : [];
+        return Response.json({
+          check_runs: runs.map((run) => ({
+            id: run.id,
+            name: run.name,
+            head_sha: sha,
+            status: run.status,
+            conclusion: run.conclusion,
+            app: { id: 10, slug: "github-actions" },
+            output: {
+              title: run.name,
+              summary: run.summary ?? "",
+              annotations_count: 0,
+            },
+          })),
+        });
+      }
+
+      const suitesMatch = /\/commits\/([^/?]+)\/check-suites/.exec(url);
+      if (suitesMatch) {
+        const sha = decodeURIComponent(suitesMatch[1] ?? "");
+        const configured = mockGitHub.checkRunsBySha.get(sha);
+        const hasPending = (configured ?? []).some((run) => run.status !== "completed");
+        return Response.json({
+          check_suites:
+            configured !== undefined || mockGitHub.defaultPassingCi
+              ? [
+                  {
+                    id: 500,
+                    head_sha: sha,
+                    status: hasPending ? "in_progress" : "completed",
+                    conclusion: hasPending ? null : "success",
+                    app: { id: 10, slug: "github-actions" },
+                  },
+                ]
+              : [],
+        });
+      }
+
+      const statusMatch = /\/commits\/([^/?]+)\/status/.exec(url);
+      if (statusMatch) {
+        const sha = decodeURIComponent(statusMatch[1] ?? "");
+        return Response.json({ sha, state: "success", statuses: [] });
+      }
+
+      return new Response(`unexpected url: ${url}`, { status: 404 });
+    }),
+  );
+}
+
+function withHeadSha<T extends Pick<ReviewRequest, "headSha">>(req: T): T {
+  mockGitHub.headSha = req.headSha;
+  return req;
+}
+
 describe("ReviewOrchestrator", () => {
   beforeEach(() => {
     executed.length = 0;
@@ -49,21 +212,24 @@ describe("ReviewOrchestrator", () => {
     sandboxTestConfig.cleanupPollMs = null;
     sandboxTestConfig.destroyRetryBaseDelayMs = null;
     sandboxTestConfig.destroyTimeoutMs = null;
+    sandboxTestConfig.ciPollIntervalMs = null;
+    sandboxTestConfig.ciWaitTimeoutMs = null;
+    sandboxTestConfig.ciDiscoveryGraceMs = 0;
+    sandboxTestConfig.managedRepoConfig = null;
+    sandboxTestConfig.failTestCommands = false;
+    mockGitHub.headSha = "abc123";
+    mockGitHub.baseSha = "base000";
+    mockGitHub.defaultBranch = "main";
+    mockGitHub.isFork = false;
+    mockGitHub.diff =
+      "diff --git a/src/sum.ts b/src/sum.ts\n--- a/src/sum.ts\n+++ b/src/sum.ts\n@@ -1,1 +1,2 @@\n export const a = 1;\n+export const b = 2;\n";
+    mockGitHub.filesByRef.clear();
+    mockGitHub.checkRunsBySha.clear();
+    mockGitHub.defaultPassingCi = true;
+    mockGitHub.tokenRequestBodies.length = 0;
+    mockGitHub.requestedContentRefs.length = 0;
     clearInstallationTokenCache();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request) => {
-        const url = String(input);
-        if (url.endsWith("/app/installations/42/access_tokens")) {
-          const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-          return Response.json({ token: "ghs_inst_42", expires_at: expiresAt }, { status: 201 });
-        }
-        if (url.endsWith("/repos/octo/repo/pulls/1")) {
-          return new Response("diff --git a/src/sum.ts b/src/sum.ts", { status: 200 });
-        }
-        return new Response("unexpected url", { status: 404 });
-      }),
-    );
+    installMockGitHubFetch();
   });
 
   afterEach(() => {
@@ -172,19 +338,6 @@ describe("ReviewOrchestrator", () => {
       "src/sum.ts": "export const sum = (ns: number[]) => ns.reduce((a, b) => a + b);\n",
       "package.json": '{"name":"octo-repo"}\n',
     });
-    const tokenRequests: Array<string | undefined> = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = String(input);
-        if (url.endsWith("/app/installations/42/access_tokens")) {
-          tokenRequests.push(typeof init?.body === "string" ? init.body : undefined);
-          const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-          return Response.json({ token: "ghs_inst_42", expires_at: expiresAt }, { status: 201 });
-        }
-        return new Response("unexpected url", { status: 404 });
-      }),
-    );
 
     const toolResults: Array<{ toolName: string; isError: boolean; text: string }> = [];
     faux.setResponses([
@@ -215,7 +368,16 @@ describe("ReviewOrchestrator", () => {
       },
     ]);
 
-    expect(tokenRequests).toEqual([
+    // すべてのトークンがリポジトリ単位・最小権限スコープで発行され、無制限トークンは一切要求しない
+    expect(mockGitHub.tokenRequestBodies).toEqual([
+      JSON.stringify({
+        repositories: ["repo"],
+        permissions: { contents: "read", pull_requests: "read" },
+      }),
+      JSON.stringify({
+        repositories: ["repo"],
+        permissions: { checks: "read", statuses: "read" },
+      }),
       JSON.stringify({ repositories: ["repo"], permissions: { contents: "read" } }),
     ]);
 
@@ -225,6 +387,7 @@ describe("ReviewOrchestrator", () => {
     expect(checkoutCmd).toContain(
       "GIT_TERMINAL_PROMPT=0 git fetch --depth 1 https://github.com/octo/repo.git -- abc123",
     );
+    expect(checkoutCmd).toContain("git -c core.symlinks=false checkout -q --force FETCH_HEAD");
     expect(checkoutCmd).not.toContain("http.extraHeader");
     expect(checkoutCmd).not.toContain("ghs_inst_42");
     expect(checkoutCmd).not.toContain(expectedBasicAuth);
@@ -273,7 +436,9 @@ describe("ReviewOrchestrator", () => {
       toolCall("read_file", { path: "src/sum.ts" }),
       captureLastRead,
     ]);
-    await orchestrator.start({ ...request, deliveryId: "del-v1-a", headSha: "sha-v1" });
+    await orchestrator.start(
+      withHeadSha({ ...request, deliveryId: "del-v1-a", headSha: "sha-v1" }),
+    );
     await orchestrator.result("del-v1-a");
     expect(executed).toHaveLength(1);
     expect(destroyedSandboxes).toHaveLength(1);
@@ -281,7 +446,9 @@ describe("ReviewOrchestrator", () => {
 
     // 2 回目: 完了後の別 delivery → 破棄済みのため再取得され、前回の作業ファイル repro.txt は残らない
     faux.setResponses([toolCall("read_file", { path: "repro.txt" }), captureLastRead]);
-    await orchestrator.start({ ...request, deliveryId: "del-v1-b", headSha: "sha-v1" });
+    await orchestrator.start(
+      withHeadSha({ ...request, deliveryId: "del-v1-b", headSha: "sha-v1" }),
+    );
     await orchestrator.result("del-v1-b");
     expect(executed).toHaveLength(2);
     expect(destroyedSandboxes).toHaveLength(2);
@@ -290,7 +457,7 @@ describe("ReviewOrchestrator", () => {
 
     // 3 回目: sha-v2 に更新 → 取り直され、src/sum.ts が v2 になり、完了後に再び破棄される
     faux.setResponses([toolCall("read_file", { path: "src/sum.ts" }), captureLastRead]);
-    await orchestrator.start({ ...request, deliveryId: "del-v2", headSha: "sha-v2" });
+    await orchestrator.start(withHeadSha({ ...request, deliveryId: "del-v2", headSha: "sha-v2" }));
     await orchestrator.result("del-v2");
     expect(executed).toHaveLength(3);
     expect(executed[2]).toContain("https://github.com/octo/repo.git -- sha-v2");
@@ -306,7 +473,9 @@ describe("ReviewOrchestrator", () => {
     await runInDurableObject(stub, async (instance) => {
       const orchestrator = instance as ProductionOrchestrator;
       await expect(
-        orchestrator.start({ ...request, deliveryId: "del-fail", headSha: "fail-sha" }),
+        orchestrator.start(
+          withHeadSha({ ...request, deliveryId: "del-fail", headSha: "fail-sha" }),
+        ),
       ).rejects.toSatisfy((error: unknown) => {
         const msg = error instanceof Error ? error.message : String(error);
         expect(msg).toContain("failed to checkout octo/repo@fail-sha (exit 128)");
@@ -329,7 +498,7 @@ describe("ReviewOrchestrator", () => {
     // 失敗後は checked_out_sha が記録されないため、続く正常なリクエストで取得が走る
     remoteRepoFiles.set("octo/repo@abc123", { "src/sum.ts": "recovered\n" });
     faux.setResponses([fauxAssistantMessage(fauxText("復旧"))]);
-    const receipt = await stub.start({ ...request, deliveryId: "del-recover" });
+    const receipt = await stub.start(withHeadSha({ ...request, deliveryId: "del-recover" }));
     const result = await stub.result("del-recover");
     expect(receipt.accepted).toBe(true);
     expect(result).toMatchObject({ status: "done", text: "復旧" });
@@ -475,12 +644,14 @@ describe("ReviewOrchestrator", () => {
       ]);
 
       const orchestrator = env.ORCHESTRATOR.getByName(`octo/repo#${pullNumber}`);
-      await orchestrator.start({
-        ...request,
-        deliveryId: `del-${sha}-1`,
-        pullNumber,
-        headSha: sha,
-      });
+      await orchestrator.start(
+        withHeadSha({
+          ...request,
+          deliveryId: `del-${sha}-1`,
+          pullNumber,
+          headSha: sha,
+        }),
+      );
       const result = await orchestrator.result(`del-${sha}-1`);
 
       expect(result).toMatchObject({ status: "done", text: "テスト成功" });
@@ -516,12 +687,14 @@ describe("ReviewOrchestrator", () => {
           return fauxAssistantMessage(fauxText("2回目完了"));
         },
       ]);
-      await orchestrator.start({
-        ...request,
-        deliveryId: `del-${sha}-2`,
-        pullNumber,
-        headSha: sha,
-      });
+      await orchestrator.start(
+        withHeadSha({
+          ...request,
+          deliveryId: `del-${sha}-2`,
+          pullNumber,
+          headSha: sha,
+        }),
+      );
       await orchestrator.result(`del-${sha}-2`);
       expect(executed).toHaveLength(5);
       expect(destroyedSandboxes).toHaveLength(2);
@@ -543,7 +716,9 @@ describe("ReviewOrchestrator", () => {
 
     // 1. まず sha-ok で成功させる
     faux.setResponses([fauxAssistantMessage(fauxText("ok-1"))]);
-    await stub.start({ ...request, deliveryId: "del-ok-1", pullNumber: 910, headSha: "sha-ok" });
+    await stub.start(
+      withHeadSha({ ...request, deliveryId: "del-ok-1", pullNumber: 910, headSha: "sha-ok" }),
+    );
     await stub.result("del-ok-1");
     expect(executed).toHaveLength(2);
 
@@ -551,12 +726,14 @@ describe("ReviewOrchestrator", () => {
     await runInDurableObject(stub, async (instance) => {
       const orchestrator = instance as ProductionOrchestrator;
       await expect(
-        orchestrator.start({
-          ...request,
-          deliveryId: "del-broken",
-          pullNumber: 910,
-          headSha: "sha-broken-install",
-        }),
+        orchestrator.start(
+          withHeadSha({
+            ...request,
+            deliveryId: "del-broken",
+            pullNumber: 910,
+            headSha: "sha-broken-install",
+          }),
+        ),
       ).rejects.toThrow(
         'failed to install dependencies with "pnpm install --frozen-lockfile" (exit 1): ERR_INSTALL_FAILED: registry error',
       );
@@ -566,7 +743,9 @@ describe("ReviewOrchestrator", () => {
 
     // 3. 再び sha-ok に戻した際、古い checked_out_sha が残っていないため再取得・再インストールが走る
     faux.setResponses([fauxAssistantMessage(fauxText("ok-2"))]);
-    await stub.start({ ...request, deliveryId: "del-ok-2", pullNumber: 910, headSha: "sha-ok" });
+    await stub.start(
+      withHeadSha({ ...request, deliveryId: "del-ok-2", pullNumber: 910, headSha: "sha-ok" }),
+    );
     const result = await stub.result("del-ok-2");
     expect(result).toMatchObject({ status: "done", text: "ok-2" });
     expect(executed).toHaveLength(6);
@@ -600,6 +779,7 @@ describe("ReviewOrchestrator", () => {
     ]);
 
     const orchestrator = env.ORCHESTRATOR.getByName("octo/repo#920");
+    mockGitHub.headSha = "sha-concurrent";
 
     // 同じ head に対して 2 つの start() を同時に呼び出す
     const [r1, r2] = await Promise.all([
@@ -651,7 +831,7 @@ describe("ReviewOrchestrator", () => {
     // 旧スキーマの状態（test_commands_json 列がなく、checked_out_sha が既に保存されている状態）を再現
     await runInDurableObject(stub, async (instance) => {
       const sql = (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql;
-      sql.exec("DROP TABLE review_target");
+      sql.exec("DROP TABLE IF EXISTS review_target");
       sql.exec(`CREATE TABLE review_target (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         repository TEXT NOT NULL,
@@ -679,12 +859,14 @@ describe("ReviewOrchestrator", () => {
       },
     ]);
 
-    await stub.start({
-      ...request,
-      deliveryId: "del-legacy-1",
-      pullNumber: 930,
-      headSha: "sha-legacy",
-    });
+    await stub.start(
+      withHeadSha({
+        ...request,
+        deliveryId: "del-legacy-1",
+        pullNumber: 930,
+        headSha: "sha-legacy",
+      }),
+    );
     const result = await stub.result("del-legacy-1");
 
     expect(result).toMatchObject({ status: "done", text: "移行後レビュー完了" });
@@ -695,7 +877,7 @@ describe("ReviewOrchestrator", () => {
     expect(userPrompts[0]).toContain("テストコマンドの候補: pnpm test");
   });
 
-  it("ports().github を差し替えず get_diff / post_review / resolve_thread の 3 操作が installation token 経由で GitHub API に届く", async () => {
+  it("Read/Write 責務分離: Agent ツールは Read 専用トークンの get_diff のみ実行でき、Write 系は Orchestrator 専用 githubWritePort() から最小権限トークンで実行する", async () => {
     const githubCalls: Array<{
       url: string;
       method: string | undefined;
@@ -710,22 +892,83 @@ describe("ReviewOrchestrator", () => {
       vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
         const url = String(input);
         const headers = new Headers(init?.headers);
+        const accept = headers.get("Accept") ?? "";
         githubCalls.push({
           url,
           method: init?.method,
           auth: headers.get("Authorization") ?? undefined,
-          accept: headers.get("Accept") ?? undefined,
+          accept: accept || undefined,
           body: typeof init?.body === "string" ? init.body : undefined,
         });
         if (url.endsWith("/app/installations/99/access_tokens")) {
           const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-          return Response.json(
-            { token: "ghs_secret_token_99", expires_at: expiresAt },
-            { status: 201 },
-          );
+          const reqBody = typeof init?.body === "string" ? init.body : "";
+          const token = reqBody.includes('"write"')
+            ? "ghs_write_token_99"
+            : reqBody.includes('"checks"')
+              ? "ghs_checks_token_99"
+              : "ghs_read_token_99";
+          return Response.json({ token, expires_at: expiresAt }, { status: 201 });
         }
         if (url.endsWith("/repos/octo/repo/pulls/5")) {
+          if (accept.includes("v3.diff")) {
+            return new Response("diff --git a/index.ts b/index.ts\n+const x = 1;", { status: 200 });
+          }
+          return Response.json({
+            number: 5,
+            state: "open",
+            draft: false,
+            title: "PR #5",
+            body: null,
+            user: { login: "alice" },
+            base: {
+              sha: "base555",
+              ref: "main",
+              repo: { id: 100, full_name: "octo/repo", default_branch: "main" },
+            },
+            head: {
+              sha: "sha555",
+              ref: "feat/5",
+              repo: { id: 100, full_name: "octo/repo", default_branch: "main" },
+            },
+          });
+        }
+        if (url.includes("/compare/")) {
           return new Response("diff --git a/index.ts b/index.ts\n+const x = 1;", { status: 200 });
+        }
+        if (url.includes("/contents/")) {
+          return new Response("Not Found", { status: 404 });
+        }
+        if (url.includes("/check-runs")) {
+          return Response.json({
+            check_runs: [
+              {
+                id: 10,
+                name: "CI / test",
+                head_sha: "sha555",
+                status: "completed",
+                conclusion: "success",
+                app: { id: 10, slug: "github-actions" },
+                output: { title: "ok", summary: "", annotations_count: 0 },
+              },
+            ],
+          });
+        }
+        if (url.includes("/check-suites")) {
+          return Response.json({
+            check_suites: [
+              {
+                id: 1,
+                head_sha: "sha555",
+                status: "completed",
+                conclusion: "success",
+                app: { id: 10, slug: "github-actions" },
+              },
+            ],
+          });
+        }
+        if (url.includes("/status")) {
+          return Response.json({ sha: "sha555", state: "success", statuses: [] });
         }
         if (url.endsWith("/repos/octo/repo/pulls/5/reviews")) {
           return Response.json({ id: 501 }, { status: 200 });
@@ -741,8 +984,6 @@ describe("ReviewOrchestrator", () => {
 
     faux.setResponses([
       toolCall("get_diff", {}),
-      toolCall("resolve_thread", { threadId: "PRRT_kwDO999" }),
-      toolCall("post_review", { body: "すべて問題ありません。" }),
       (context) => {
         for (const msg of context.messages) {
           if (msg.role === "toolResult") {
@@ -752,7 +993,7 @@ describe("ReviewOrchestrator", () => {
             toolResults.push({ toolName: msg.toolName, isError: msg.isError, text });
           }
         }
-        return fauxAssistantMessage(fauxText("GitHub 3 操作完了"));
+        return fauxAssistantMessage(fauxText("Read ツールのみ実行完了"));
       },
     ]);
 
@@ -766,65 +1007,64 @@ describe("ReviewOrchestrator", () => {
     });
     const result = await orchestrator.result("delivery-github-5");
 
-    expect(result).toMatchObject({ status: "done", text: "GitHub 3 操作完了" });
+    expect(result).toMatchObject({ status: "done", text: "Read ツールのみ実行完了" });
     expect(toolResults).toEqual([
       {
         toolName: "get_diff",
         isError: false,
         text: "diff --git a/index.ts b/index.ts\n+const x = 1;",
       },
-      { toolName: "resolve_thread", isError: false, text: "resolved PRRT_kwDO999" },
-      { toolName: "post_review", isError: false, text: "posted" },
     ]);
-    // ツール結果にトークンが含まれないことを確認
     for (const r of toolResults) {
-      expect(r.text).not.toContain("ghs_secret_token_99");
+      expect(r.text).not.toContain("ghs_read_token_99");
+      expect(r.text).not.toContain("ghs_write_token_99");
     }
 
-    // チェックアウト用（最小権限: repo + contents: read）と PR 操作用でトークン発行が分離され、
-    // PR 操作 3 回は 2 つ目のトークンをキャッシュ再利用する（計 5 回）
-    expect(githubCalls).toHaveLength(5);
-    expect(githubCalls[0]).toMatchObject({
-      url: "https://api.github.com/app/installations/99/access_tokens",
-      method: "POST",
-      body: JSON.stringify({ repositories: ["repo"], permissions: { contents: "read" } }),
-    });
-    expect(githubCalls[0]?.auth).toMatch(/^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+    // ports().github に Write 系が存在せず、Orchestrator 専用 githubWritePort() からのみ Write トークンで投稿・解決できる
+    await runInDurableObject(orchestrator, async (instance) => {
+      const typed = instance as unknown as {
+        ports(): { github: Record<string, unknown> };
+        githubWritePort(): GitHubWritePort;
+      };
+      expect("postReview" in typed.ports().github).toBe(false);
+      expect("resolveThread" in typed.ports().github).toBe(false);
 
-    expect(githubCalls[1]).toMatchObject({
-      url: "https://api.github.com/app/installations/99/access_tokens",
-      method: "POST",
-      body: undefined,
+      const writePort = typed.githubWritePort();
+      await writePort.resolveThread("PRRT_kwDO999");
+      const posted = await writePort.postReview({
+        commitId: "sha555",
+        event: "COMMENT",
+        body: "すべて問題ありません。",
+        comments: [{ path: "index.ts", line: 1, body: "確認済み" }],
+      });
+      expect(posted).toEqual({ id: 501 });
     });
-    expect(githubCalls[1]?.auth).toMatch(/^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
 
-    expect(githubCalls.slice(2)).toEqual([
-      {
-        url: "https://api.github.com/repos/octo/repo/pulls/5",
-        method: "GET",
-        auth: "Bearer ghs_secret_token_99",
-        accept: "application/vnd.github.v3.diff",
-        body: undefined,
-      },
-      {
-        url: "https://api.github.com/graphql",
-        method: "POST",
-        auth: "Bearer ghs_secret_token_99",
-        accept: "application/vnd.github+json",
-        body: JSON.stringify({
-          query:
-            "mutation($threadId: ID!) { resolveReviewThread(input: { threadId: $threadId }) { thread { id isResolved } } }",
-          variables: { threadId: "PRRT_kwDO999" },
-        }),
-      },
-      {
-        url: "https://api.github.com/repos/octo/repo/pulls/5/reviews",
-        method: "POST",
-        auth: "Bearer ghs_secret_token_99",
-        accept: "application/vnd.github+json",
-        body: JSON.stringify({ body: "すべて問題ありません。", event: "COMMENT" }),
-      },
+    const tokenBodies = githubCalls
+      .filter((call) => call.url.endsWith("/app/installations/99/access_tokens"))
+      .map((call) => call.body);
+    expect(tokenBodies).toEqual([
+      JSON.stringify({
+        repositories: ["repo"],
+        permissions: { contents: "read", pull_requests: "read" },
+      }),
+      JSON.stringify({
+        repositories: ["repo"],
+        permissions: { checks: "read", statuses: "read" },
+      }),
+      JSON.stringify({ repositories: ["repo"], permissions: { contents: "read" } }),
+      JSON.stringify({ repositories: ["repo"], permissions: { pull_requests: "write" } }),
     ]);
+
+    expect(githubCalls.find((c) => c.url.endsWith("/pulls/5/reviews"))).toMatchObject({
+      auth: "Bearer ghs_write_token_99",
+      body: JSON.stringify({
+        body: "すべて問題ありません。",
+        event: "COMMENT",
+        commit_id: "sha555",
+        comments: [{ path: "index.ts", line: 1, side: "RIGHT", body: "確認済み" }],
+      }),
+    });
   });
 
   it("チェックアウトがタイムアウトした場合はトークンをマスクしてタイムアウトエラーを投げ、コンテナを即破棄する", async () => {
@@ -835,12 +1075,14 @@ describe("ReviewOrchestrator", () => {
     await runInDurableObject(stub, async (instance) => {
       const orchestrator = instance as ProductionOrchestrator;
       await expect(
-        orchestrator.start({
-          ...request,
-          deliveryId: "del-checkout-timeout",
-          pullNumber: 940,
-          headSha: "timeout-sha",
-        }),
+        orchestrator.start(
+          withHeadSha({
+            ...request,
+            deliveryId: "del-checkout-timeout",
+            pullNumber: 940,
+            headSha: "timeout-sha",
+          }),
+        ),
       ).rejects.toSatisfy((error: unknown) => {
         const msg = error instanceof Error ? error.message : String(error);
         expect(msg).toContain("timed out while checking out octo/repo@timeout-sha (exit 124)");
@@ -856,8 +1098,8 @@ describe("ReviewOrchestrator", () => {
   });
 
   it("最大生存時間 (TTL) を超過すると実行中のレビューをデッドロックせず中断・強制破棄し、以後のゾンビ再生成も防ぐ", async () => {
-    sandboxTestConfig.maxLifetimeMs = 150;
-    sandboxTestConfig.cleanupPollMs = 150;
+    sandboxTestConfig.maxLifetimeMs = 600;
+    sandboxTestConfig.cleanupPollMs = 100;
     sandboxTestConfig.hangCommand = "sleep 999";
 
     faux.setResponses([
@@ -866,26 +1108,32 @@ describe("ReviewOrchestrator", () => {
     ]);
 
     const stub = env.ORCHESTRATOR.getByName("octo/repo#950");
-    await stub.start({
-      ...request,
-      deliveryId: "del-ttl-expire",
-      pullNumber: 950,
-      headSha: "sha-ttl",
-    });
+    await stub.start(
+      withHeadSha({
+        ...request,
+        deliveryId: "del-ttl-expire",
+        pullNumber: 950,
+        headSha: "sha-ttl",
+      }),
+    );
 
-    // モデルがハング中の exec を呼ぶことを確認し、TTL 超過のアラームで自動中断・破棄されるのを待つ
-    await vi.waitFor(() => {
-      expect(executed).toContain("sleep 999");
-    });
+    await vi.waitFor(
+      () => {
+        expect(executed).toContain("sleep 999");
+      },
+      { timeout: 3_000 },
+    );
 
     const outcome = await stub.result("del-ttl-expire");
     expect(outcome.status).toBe("unanswered");
-    await vi.waitFor(() => {
-      expect(destroyedSandboxes).toHaveLength(1);
-    });
+    await vi.waitFor(
+      () => {
+        expect(destroyedSandboxes).toHaveLength(1);
+      },
+      { timeout: 3_000 },
+    );
     expect(sandboxFiles.size).toBe(0);
 
-    // 強制破棄後に ports().sandbox が呼ばれても RUNNER へ届かず遮断される
     await runInDurableObject(stub, async (instance) => {
       const ports = (
         instance as unknown as {
@@ -902,16 +1150,17 @@ describe("ReviewOrchestrator", () => {
   it("DO 退避で完了監視が失われたアイドル状態のサンドボックスを Lifecycle ジョブ (onJob) で回収する", async () => {
     faux.setResponses([fauxAssistantMessage(fauxText("完了済み"))]);
     const stub = env.ORCHESTRATOR.getByName("octo/repo#960");
-    await stub.start({
-      ...request,
-      deliveryId: "del-recovery",
-      pullNumber: 960,
-      headSha: "sha-rec",
-    });
+    await stub.start(
+      withHeadSha({
+        ...request,
+        deliveryId: "del-recovery",
+        pullNumber: 960,
+        headSha: "sha-rec",
+      }),
+    );
     await stub.result("del-recovery");
     expect(destroyedSandboxes).toHaveLength(1);
 
-    // DO 退避により sandbox_active=1 とクリーンアップジョブが残存した状態を再現する
     await runInDurableObject(stub, async (instance) => {
       const orchestrator = instance as unknown as {
         ctx: DurableObjectState;
@@ -954,19 +1203,19 @@ describe("ReviewOrchestrator", () => {
 
     faux.setResponses([fauxAssistantMessage(fauxText("レビュー自体は成功"))]);
     const stub = env.ORCHESTRATOR.getByName("octo/repo#970");
-    await stub.start({
-      ...request,
-      deliveryId: "del-destroy-retry",
-      pullNumber: 970,
-      headSha: "sha-retry",
-    });
+    await stub.start(
+      withHeadSha({
+        ...request,
+        deliveryId: "del-destroy-retry",
+        pullNumber: 970,
+        headSha: "sha-retry",
+      }),
+    );
 
     const outcome = await stub.result("del-destroy-retry");
     expect(outcome).toMatchObject({ status: "done", text: "レビュー自体は成功" });
-    // 1 回目の破棄は失敗しているためまだ destroyedSandboxes には入っていない
     expect(destroyedSandboxes).toHaveLength(0);
 
-    // バックオフ経過後のアラームリトライで破棄が完了する
     await vi.waitFor(
       () => {
         expect(destroyedSandboxes).toHaveLength(1);
@@ -983,6 +1232,7 @@ describe("ReviewOrchestrator", () => {
     });
 
     const stub = env.ORCHESTRATOR.getByName("octo/repo#975");
+    mockGitHub.headSha = "sha-concurrent-fail";
     await runInDurableObject(stub, async (instance) => {
       const orchestrator = instance as ProductionOrchestrator;
       const results = await Promise.allSettled([
@@ -1014,21 +1264,21 @@ describe("ReviewOrchestrator", () => {
 
     faux.setResponses([fauxAssistantMessage(fauxText("完了"))]);
     const stub = env.ORCHESTRATOR.getByName("octo/repo#976");
-    await stub.start({
-      ...request,
-      deliveryId: "del-no-rewind",
-      pullNumber: 976,
-      headSha: "sha-no-rewind",
-    });
+    await stub.start(
+      withHeadSha({
+        ...request,
+        deliveryId: "del-no-rewind",
+        pullNumber: 976,
+        headSha: "sha-no-rewind",
+      }),
+    );
 
     await stub.result("del-no-rewind");
     expect(destroyedSandboxes).toHaveLength(0);
 
-    // 再度 result() を呼んでもバックオフを無視して即時 destroy() を叩かないこと
     await stub.result("del-no-rewind");
     expect(destroyedSandboxes).toHaveLength(0);
 
-    // バックオフ経過後のアラームリトライで 1 回だけ破棄完了する
     await vi.waitFor(
       () => {
         expect(destroyedSandboxes).toHaveLength(1);
@@ -1043,17 +1293,18 @@ describe("ReviewOrchestrator", () => {
 
     faux.setResponses([fauxAssistantMessage(fauxText("完了"))]);
     const stub = env.ORCHESTRATOR.getByName("octo/repo#977");
-    await stub.start({
-      ...request,
-      deliveryId: "del-max-retry",
-      pullNumber: 977,
-      headSha: "sha-max-retry",
-    });
+    await stub.start(
+      withHeadSha({
+        ...request,
+        deliveryId: "del-max-retry",
+        pullNumber: 977,
+        headSha: "sha-max-retry",
+      }),
+    );
 
     await stub.result("del-max-retry");
     expect(destroyedSandboxes).toHaveLength(0);
 
-    // 最大リトライ（5 回）消化後、sandbox_active が 0 になりジョブが停止することを確認
     await vi.waitFor(
       async () => {
         const active = await runInDurableObject(stub, (instance) => {
@@ -1076,20 +1327,20 @@ describe("ReviewOrchestrator", () => {
     sandboxTestConfig.destroyTimeoutMs = 40;
     sandboxTestConfig.destroyRetryBaseDelayMs = 120;
 
-    // 1. 破棄ハング時に result() がタイムアウト上限で戻り、永続リトライジョブで後から破棄完了する
     faux.setResponses([fauxAssistantMessage(fauxText("1回目完了"))]);
     const stub1 = env.ORCHESTRATOR.getByName("octo/repo#978");
-    await stub1.start({
-      ...request,
-      deliveryId: "del-hang-retry",
-      pullNumber: 978,
-      headSha: "sha-hang-1",
-    });
+    await stub1.start(
+      withHeadSha({
+        ...request,
+        deliveryId: "del-hang-retry",
+        pullNumber: 978,
+        headSha: "sha-hang-1",
+      }),
+    );
 
     const startedWait = Date.now();
     const res1 = await stub1.result("del-hang-retry");
     expect(res1).toMatchObject({ status: "done", text: "1回目完了" });
-    // 500ms のハング完了を待たずに破棄タイムアウト (40ms) で返ること
     expect(Date.now() - startedWait).toBeLessThan(350);
     expect(destroyedSandboxes).toHaveLength(0);
 
@@ -1100,29 +1351,32 @@ describe("ReviewOrchestrator", () => {
       { timeout: 2_000 },
     );
 
-    // 2. 破棄がハングした直後でも同じ PR の次回 start() が無期限停止せず完了する
     sandboxTestConfig.destroyHangCount = 1;
     faux.setResponses([
       fauxAssistantMessage(fauxText("先行完了")),
       fauxAssistantMessage(fauxText("後続完了")),
     ]);
     const stub2 = env.ORCHESTRATOR.getByName("octo/repo#979");
-    await stub2.start({
-      ...request,
-      deliveryId: "del-hang-first",
-      pullNumber: 979,
-      headSha: "sha-hang-a",
-    });
+    await stub2.start(
+      withHeadSha({
+        ...request,
+        deliveryId: "del-hang-first",
+        pullNumber: 979,
+        headSha: "sha-hang-a",
+      }),
+    );
     const firstOutcome = await stub2.result("del-hang-first");
     expect(firstOutcome).toMatchObject({ status: "done", text: "先行完了" });
 
     const secondStartAt = Date.now();
-    await stub2.start({
-      ...request,
-      deliveryId: "del-hang-second",
-      pullNumber: 979,
-      headSha: "sha-hang-b",
-    });
+    await stub2.start(
+      withHeadSha({
+        ...request,
+        deliveryId: "del-hang-second",
+        pullNumber: 979,
+        headSha: "sha-hang-b",
+      }),
+    );
     const secondOutcome = await stub2.result("del-hang-second");
     expect(secondOutcome).toMatchObject({ status: "done", text: "後続完了" });
     expect(Date.now() - secondStartAt).toBeLessThan(350);
@@ -1131,17 +1385,18 @@ describe("ReviewOrchestrator", () => {
   it("後片付けの事前・事後処理（ジョブ登録/解除）が例外を投げてもレビュー結果や元のセットアップエラーを失わず次回開始も成功する", async () => {
     const stub = env.ORCHESTRATOR.getByName("octo/repo#980");
 
-    // 1. レビュー完了後のジョブ解除が一時失敗しても result() は成功結果を返し、次回 start() も通る
     faux.setResponses([
       fauxAssistantMessage(fauxText("完了結果1")),
       fauxAssistantMessage(fauxText("完了結果2")),
     ]);
-    await stub.start({
-      ...request,
-      deliveryId: "del-cleanup-err-1",
-      pullNumber: 980,
-      headSha: "sha-err-1",
-    });
+    await stub.start(
+      withHeadSha({
+        ...request,
+        deliveryId: "del-cleanup-err-1",
+        pullNumber: 980,
+        headSha: "sha-err-1",
+      }),
+    );
     await runInDurableObject(stub, (instance) => {
       const lifecycle = (
         instance as unknown as {
@@ -1176,21 +1431,20 @@ describe("ReviewOrchestrator", () => {
       });
     });
 
-    // waitUntil / result() のどちらで cancel が走ってもレビュー結果自体は正常に返る
     const res1 = await stub.result("del-cleanup-err-1");
     expect(res1).toMatchObject({ status: "done", text: "完了結果1" });
 
-    // 次回 start() も後片付けエラーを引きずらず成功する
-    await stub.start({
-      ...request,
-      deliveryId: "del-cleanup-err-2",
-      pullNumber: 980,
-      headSha: "sha-err-2",
-    });
+    await stub.start(
+      withHeadSha({
+        ...request,
+        deliveryId: "del-cleanup-err-2",
+        pullNumber: 980,
+        headSha: "sha-err-2",
+      }),
+    );
     const res2 = await stub.result("del-cleanup-err-2");
     expect(res2).toMatchObject({ status: "done", text: "完了結果2" });
 
-    // 2. セットアップ失敗時の後片付けで事前処理（jobs.push）が例外を投げても、元のセットアップエラーを失わない
     remoteRepoFiles.set("octo/repo@sha-setup-err-cleanup-err", {
       "package.json": JSON.stringify({ name: "fail-install", scripts: { test: "vitest run" } }),
       "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
@@ -1221,7 +1475,6 @@ describe("ReviewOrchestrator", () => {
             ...origJobs,
             push: async (opts: unknown) => {
               pushCalls += 1;
-              // 1 回目は checkout 開始時の予約なので通し、2 回目（setup_failed 後片付けの事前処理）で失敗させる
               if (pushCalls === 2) {
                 throw new Error("simulated cleanup push error");
               }
@@ -1232,12 +1485,14 @@ describe("ReviewOrchestrator", () => {
       });
 
       await expect(
-        orchestrator.start({
-          ...request,
-          deliveryId: "del-setup-err-preserve",
-          pullNumber: 981,
-          headSha: "sha-setup-err-cleanup-err",
-        }),
+        orchestrator.start(
+          withHeadSha({
+            ...request,
+            deliveryId: "del-setup-err-preserve",
+            pullNumber: 981,
+            headSha: "sha-setup-err-cleanup-err",
+          }),
+        ),
       ).rejects.toThrow(
         'failed to install dependencies with "pnpm install --frozen-lockfile" (exit 1): ERR_INSTALL_FAILED: registry error',
       );
@@ -1257,21 +1512,20 @@ describe("ReviewOrchestrator", () => {
 
     const stub = env.ORCHESTRATOR.getByName("octo/repo#982");
 
-    // セットアップ中に TTL 超過の強制破棄（1 回目 destroy 失敗 → sandbox_active=0 で pendingDestroy 予約）が起き、
-    // 直後にセットアップが失敗して setup_failed の後片付けが走っても pendingDestroy ジョブは解除されない
     await runInDurableObject(stub, async (instance) => {
       const orchestrator = instance as ProductionOrchestrator;
       await expect(
-        orchestrator.start({
-          ...request,
-          deliveryId: "del-force-setup-race",
-          pullNumber: 982,
-          headSha: "sha-force-then-setup-fail",
-        }),
+        orchestrator.start(
+          withHeadSha({
+            ...request,
+            deliveryId: "del-force-setup-race",
+            pullNumber: 982,
+            headSha: "sha-force-then-setup-fail",
+          }),
+        ),
       ).rejects.toThrow("sandbox was destroyed while preparing target");
     });
 
-    // 1 回目は強制破棄が失敗しているため未破棄だが、pendingDestroy ジョブが生きておりリトライで破棄完了する
     expect(destroyedSandboxes).toHaveLength(0);
     await vi.waitFor(
       () => {
@@ -1279,6 +1533,474 @@ describe("ReviewOrchestrator", () => {
       },
       { timeout: 2_000 },
     );
+  });
+
+  describe("Step 0 / Step 1 プロトコル・static_only 強制", () => {
+    it("CI 待機がタイムアウトすると Sandbox 決定論的テスト実行へフォールバックし、結果を記録してレビューへ進む", async () => {
+      remoteRepoFiles.set("octo/repo@sha-timeout-fb", {
+        "package.json": JSON.stringify({ name: "fb-app", scripts: { test: "vitest run" } }),
+        "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+      });
+      mockGitHub.checkRunsBySha.set("sha-timeout-fb", [
+        { id: 1, name: "CI / test", status: "in_progress", conclusion: null },
+      ]);
+      sandboxTestConfig.ciPollIntervalMs = 30;
+      sandboxTestConfig.ciWaitTimeoutMs = 80;
+
+      faux.setResponses([fauxAssistantMessage(fauxText("フォールバック後にレビュー完了"))]);
+      const stub = env.ORCHESTRATOR.getByName("octo/repo#1001");
+      const receipt = await stub.start(
+        withHeadSha({
+          ...request,
+          deliveryId: "del-timeout-fb",
+          pullNumber: 1001,
+          headSha: "sha-timeout-fb",
+        }),
+      );
+      expect(receipt).toMatchObject({ accepted: true, stage: "awaiting_ci" });
+
+      const outcome = await stub.result("del-timeout-fb");
+      expect(outcome).toMatchObject({ status: "done", text: "フォールバック後にレビュー完了" });
+
+      // タイムアウト後に Sandbox で checkout → install → 決定論的 pnpm test が実行されていること
+      expect(executed).toEqual([
+        expect.stringContaining("https://github.com/octo/repo.git -- sha-timeout-fb"),
+        "pnpm install --frozen-lockfile",
+        "pnpm test",
+      ]);
+      const state = await stub.step1Status("del-timeout-fb");
+      expect(state?.testReport).toMatchObject({
+        source: "sandbox",
+        overallStatus: "passed",
+        shouldEarlyReject: false,
+      });
+    });
+
+    it("CI 失敗時に baseSha と照合し、base 既存失敗は継続、変更起因失敗は earlyRejectPolicy 3 モードに従って判定する", async () => {
+      const callsBefore = faux.state.callCount;
+
+      // 1. baseSha でも落ちている failed_preexisting -> on_test_failure でも継続
+      mockGitHub.checkRunsBySha.set("sha-preexist", [
+        { id: 1, name: "CI / test", status: "completed", conclusion: "failure" },
+      ]);
+      mockGitHub.checkRunsBySha.set("base000", [
+        { id: 2, name: "CI / test", status: "completed", conclusion: "failure" },
+      ]);
+      faux.setResponses([fauxAssistantMessage(fauxText("既存失敗は継続"))]);
+      const stubPre = env.ORCHESTRATOR.getByName("octo/repo#1002");
+      await stubPre.start(
+        withHeadSha({
+          ...request,
+          deliveryId: "del-preexist",
+          pullNumber: 1002,
+          headSha: "sha-preexist",
+        }),
+      );
+      await expect(stubPre.result("del-preexist")).resolves.toMatchObject({
+        status: "done",
+        text: "既存失敗は継続",
+      });
+      const preState = await stubPre.step1Status("del-preexist");
+      expect(preState?.testReport?.overallStatus).toBe("failed_preexisting");
+      expect(faux.state.callCount).toBe(callsBefore + 1);
+
+      // 2. 変更起因 test 失敗 + on_test_failure -> early_rejected（LLM 非起動・Sandbox 非起動）
+      executed.length = 0;
+      mockGitHub.checkRunsBySha.set("base000", [
+        { id: 2, name: "CI / test", status: "completed", conclusion: "success" },
+      ]);
+      mockGitHub.checkRunsBySha.set("sha-reg-fail", [
+        { id: 3, name: "CI / test", status: "completed", conclusion: "failure" },
+      ]);
+      const stubRej = env.ORCHESTRATOR.getByName("octo/repo#1003");
+      const rejReceipt = await stubRej.start(
+        withHeadSha({
+          ...request,
+          deliveryId: "del-reg-fail",
+          pullNumber: 1003,
+          headSha: "sha-reg-fail",
+        }),
+      );
+      expect(rejReceipt).toMatchObject({ accepted: true, stage: "early_rejected" });
+      await expect(stubRej.result("del-reg-fail")).resolves.toMatchObject({
+        status: "early_rejected",
+      });
+      expect(faux.state.callCount).toBe(callsBefore + 1);
+      expect(executed).toHaveLength(0);
+
+      // 3. 変更起因 test 失敗 + never -> LLM へ継続
+      sandboxTestConfig.managedRepoConfig = { earlyRejectPolicy: "never" };
+      faux.setResponses([fauxAssistantMessage(fauxText("never なので継続"))]);
+      const stubNever = env.ORCHESTRATOR.getByName("octo/repo#1004");
+      await stubNever.start(
+        withHeadSha({
+          ...request,
+          deliveryId: "del-never",
+          pullNumber: 1004,
+          headSha: "sha-reg-fail",
+        }),
+      );
+      await expect(stubNever.result("del-never")).resolves.toMatchObject({
+        status: "done",
+        text: "never なので継続",
+      });
+      const neverState = await stubNever.step1Status("del-never");
+      expect(neverState?.testReport?.hasRegressionFailure).toBe(true);
+      expect(neverState?.testReport?.shouldEarlyReject).toBe(false);
+
+      // 4. default_branch の .github/review-harness.json で strict を宣言 + lint 単体失敗 -> early_rejected
+      sandboxTestConfig.managedRepoConfig = null;
+      mockGitHub.requestedContentRefs.length = 0;
+      mockGitHub.filesByRef.set(
+        "main:.github/review-harness.json",
+        JSON.stringify({ earlyRejectPolicy: "strict", budgetUsd: 999 }),
+      );
+      mockGitHub.checkRunsBySha.set("sha-lint-fail", [
+        { id: 4, name: "CI / test", status: "completed", conclusion: "success" },
+        { id: 5, name: "Biome Lint", status: "completed", conclusion: "failure" },
+      ]);
+      const stubStrict = env.ORCHESTRATOR.getByName("octo/repo#1005");
+      const strictReceipt = await stubStrict.start(
+        withHeadSha({
+          ...request,
+          deliveryId: "del-strict-lint",
+          pullNumber: 1005,
+          headSha: "sha-lint-fail",
+        }),
+      );
+      expect(strictReceipt).toMatchObject({ accepted: true, stage: "early_rejected" });
+      // PR head ではなく defaultBranch ("main") のみから設定ファイルを読んでいること
+      expect(
+        mockGitHub.requestedContentRefs.filter((r) => r.path.includes("review-harness.json")),
+      ).toEqual([{ path: ".github/review-harness.json", ref: "main" }]);
+    });
+
+    it("外部フォーク PR および ci_script_hazard 検出時は static_only を強制し、setupProject / exec / write_file を全面遮断する", async () => {
+      // 1. 外部フォーク PR（CI なしでも Sandbox は一切起動しない。read_file は GitHub Contents API で読める）
+      mockGitHub.isFork = true;
+      mockGitHub.defaultPassingCi = false;
+      mockGitHub.filesByRef.set("sha-fork-1:src/sum.ts", "export const sum = () => 42;\n");
+
+      const toolResults: Array<{ toolName: string; isError: boolean; text: string }> = [];
+      faux.setResponses([
+        toolCall("read_file", { path: "src/sum.ts" }),
+        (context) => {
+          for (const msg of context.messages) {
+            if (msg.role === "toolResult") {
+              const text = msg.content
+                .flatMap((part) => (part.type === "text" ? [part.text] : []))
+                .join("");
+              toolResults.push({ toolName: msg.toolName, isError: msg.isError, text });
+            }
+          }
+          return fauxAssistantMessage(fauxText("フォーク PR 静的レビュー完了"));
+        },
+      ]);
+
+      const stubFork = env.ORCHESTRATOR.getByName("octo/repo#1010");
+      const forkReceipt = await stubFork.start(
+        withHeadSha({
+          ...request,
+          deliveryId: "del-fork-1",
+          pullNumber: 1010,
+          headSha: "sha-fork-1",
+          isFork: true,
+        }),
+      );
+      expect(forkReceipt).toMatchObject({
+        accepted: true,
+        executionMode: "static_only",
+        stage: "primary_review",
+      });
+      await expect(stubFork.result("del-fork-1")).resolves.toMatchObject({
+        status: "done",
+        text: "フォーク PR 静的レビュー完了",
+      });
+      expect(executed).toHaveLength(0);
+      expect(toolResults).toEqual([
+        { toolName: "read_file", isError: false, text: "export const sum = () => 42;\n" },
+      ]);
+
+      // static_only 中の exec / writeFile は StaticOnlyPolicyError で機械遮断される
+      await runInDurableObject(stubFork, async (instance) => {
+        const ports = (
+          instance as unknown as {
+            ports(): {
+              sandbox: {
+                exec(cmd: string): Promise<unknown>;
+                writeFile(path: string, content: string): Promise<void>;
+              };
+            };
+          }
+        ).ports();
+        await expect(ports.sandbox.exec("echo evil")).rejects.toThrow(StaticOnlyPolicyError);
+        await expect(ports.sandbox.writeFile("a.txt", "evil")).rejects.toThrow(
+          StaticOnlyPolicyError,
+        );
+      });
+      expect(executed).toHaveLength(0);
+
+      // 2. 内部 PR でも package.json の postinstall 改ざん (ci_script_hazard) で static_only 強制
+      mockGitHub.isFork = false;
+      mockGitHub.diff = [
+        "diff --git a/package.json b/package.json",
+        "--- a/package.json",
+        "+++ b/package.json",
+        "@@ -1,2 +1,3 @@",
+        ' "scripts": {',
+        '+  "postinstall": "node ./evil.js"',
+        " }",
+      ].join("\n");
+      faux.setResponses([fauxAssistantMessage(fauxText("ハザード検知で静的レビュー"))]);
+      const stubHaz = env.ORCHESTRATOR.getByName("octo/repo#1011");
+      const hazReceipt = await stubHaz.start(
+        withHeadSha({
+          ...request,
+          deliveryId: "del-hazard-1",
+          pullNumber: 1011,
+          headSha: "sha-hazard-1",
+        }),
+      );
+      expect(hazReceipt).toMatchObject({ executionMode: "static_only" });
+      await expect(stubHaz.result("del-hazard-1")).resolves.toMatchObject({
+        status: "done",
+        text: "ハザード検知で静的レビュー",
+      });
+      expect(executed).toHaveLength(0);
+      const hazState = await stubHaz.step1Status("del-hazard-1");
+      expect(hazState?.staticOnlyReason).toBe("ci_script_hazard");
+      expect(hazState?.testReport?.executionMode).toBe("static_only");
+    });
+
+    it("遅延到着した古い headSha の webhook が進行中 awaiting_ci の新世代を破壊しない", async () => {
+      mockGitHub.headSha = "sha-new-2";
+      mockGitHub.checkRunsBySha.set("sha-new-2", [
+        { id: 1, name: "CI / test", status: "in_progress", conclusion: null },
+      ]);
+      sandboxTestConfig.ciPollIntervalMs = 60_000;
+      sandboxTestConfig.ciWaitTimeoutMs = 300_000;
+      faux.setResponses([fauxAssistantMessage(fauxText("新世代が保護されて完了"))]);
+
+      const stub = env.ORCHESTRATOR.getByName("octo/repo#1020");
+      const newReceipt = await stub.start({
+        ...request,
+        deliveryId: "del-order-new",
+        pullNumber: 1020,
+        headSha: "sha-new-2",
+      });
+      expect(newReceipt).toMatchObject({ accepted: true, stage: "awaiting_ci" });
+
+      // 古い headSha の遅延 webhook が後から到着 -> GitHub 上の最新は sha-new-2 なので stale 扱い
+      const staleReceipt = await stub.start({
+        ...request,
+        deliveryId: "del-order-old",
+        pullNumber: 1020,
+        headSha: "sha-old-1",
+      });
+      expect(staleReceipt).toMatchObject({ accepted: false, stage: "superseded" });
+
+      // 新世代は awaiting_ci のまま保持され、CI 完了通知でそのままレビュー完走する
+      await expect(stub.step1Status("del-order-new")).resolves.toMatchObject({
+        stage: "awaiting_ci",
+        headSha: "sha-new-2",
+      });
+      mockGitHub.checkRunsBySha.set("sha-new-2", [
+        { id: 1, name: "CI / test", status: "completed", conclusion: "success" },
+      ]);
+      const wake = await stub.notifyCheckSuiteCompleted({
+        deliveryId: "del-cs-order",
+        repository: "octo/repo",
+        pullNumber: 1020,
+        headSha: "sha-new-2",
+        conclusion: "success",
+      });
+      expect(wake.woken).toBe(true);
+      await expect(stub.result("del-order-new")).resolves.toMatchObject({
+        status: "done",
+        text: "新世代が保護されて完了",
+      });
+    });
+
+    it("awaiting_ci 中に新 headSha への synchronize または PR closed が来ると旧待機を superseded で停止する", async () => {
+      sandboxTestConfig.ciPollIntervalMs = 60_000;
+      sandboxTestConfig.ciWaitTimeoutMs = 300_000;
+
+      // 1. synchronize で新 headSha へ切替
+      mockGitHub.headSha = "sha-sync-1";
+      mockGitHub.checkRunsBySha.set("sha-sync-1", [
+        { id: 1, name: "CI / test", status: "in_progress", conclusion: null },
+      ]);
+      const stubSync = env.ORCHESTRATOR.getByName("octo/repo#1021");
+      await stubSync.start({
+        ...request,
+        deliveryId: "del-sync-old",
+        pullNumber: 1021,
+        headSha: "sha-sync-1",
+      });
+
+      mockGitHub.headSha = "sha-sync-2";
+      mockGitHub.checkRunsBySha.set("sha-sync-2", [
+        { id: 2, name: "CI / test", status: "completed", conclusion: "success" },
+      ]);
+      faux.setResponses([fauxAssistantMessage(fauxText("新 commit をレビュー"))]);
+      await stubSync.start({
+        ...request,
+        deliveryId: "del-sync-new",
+        pullNumber: 1021,
+        headSha: "sha-sync-2",
+        action: "synchronize",
+      });
+      await expect(stubSync.result("del-sync-old")).resolves.toMatchObject({
+        status: "superseded",
+      });
+      await expect(stubSync.result("del-sync-new")).resolves.toMatchObject({
+        status: "done",
+        text: "新 commit をレビュー",
+      });
+
+      // 2. closed で awaiting_ci を停止
+      mockGitHub.headSha = "sha-close-wait";
+      mockGitHub.checkRunsBySha.set("sha-close-wait", [
+        { id: 3, name: "CI / test", status: "in_progress", conclusion: null },
+      ]);
+      const stubClose = env.ORCHESTRATOR.getByName("octo/repo#1022");
+      await stubClose.start({
+        ...request,
+        deliveryId: "del-close-wait",
+        pullNumber: 1022,
+        headSha: "sha-close-wait",
+      });
+      const closed = await stubClose.handlePullRequestClosed({
+        deliveryId: "del-close-event",
+        repository: "octo/repo",
+        pullNumber: 1022,
+      });
+      expect(closed.cancelledCiWait).toBe(true);
+      await expect(stubClose.result("del-close-wait")).resolves.toMatchObject({
+        status: "superseded",
+      });
+    });
+
+    it("同一 headSha に複数 deliveryId が awaiting_ci で並んでもジョブ衝突せず両方起床して完了する", async () => {
+      mockGitHub.headSha = "sha-multi-wait";
+      mockGitHub.checkRunsBySha.set("sha-multi-wait", [
+        { id: 1, name: "CI / test", status: "in_progress", conclusion: null },
+      ]);
+      sandboxTestConfig.ciPollIntervalMs = 60_000;
+      sandboxTestConfig.ciWaitTimeoutMs = 300_000;
+      faux.setResponses([
+        fauxAssistantMessage(fauxText("1件目完了")),
+        fauxAssistantMessage(fauxText("2件目完了")),
+      ]);
+
+      const stub = env.ORCHESTRATOR.getByName("octo/repo#1023");
+      await expect(
+        stub.start({
+          ...request,
+          deliveryId: "del-multi-1",
+          pullNumber: 1023,
+          headSha: "sha-multi-wait",
+        }),
+      ).resolves.toMatchObject({ accepted: true, stage: "awaiting_ci" });
+      await expect(
+        stub.start({
+          ...request,
+          deliveryId: "del-multi-2",
+          pullNumber: 1023,
+          headSha: "sha-multi-wait",
+        }),
+      ).resolves.toMatchObject({ accepted: true, stage: "awaiting_ci" });
+
+      mockGitHub.checkRunsBySha.set("sha-multi-wait", [
+        { id: 1, name: "CI / test", status: "completed", conclusion: "success" },
+      ]);
+      await stub.notifyCheckSuiteCompleted({
+        deliveryId: "del-cs-multi",
+        repository: "octo/repo",
+        pullNumber: 1023,
+        headSha: "sha-multi-wait",
+        conclusion: "success",
+      });
+
+      const [res1, res2] = await Promise.all([
+        stub.result("del-multi-1"),
+        stub.result("del-multi-2"),
+      ]);
+      expect([res1.status, res2.status]).toEqual(["done", "done"]);
+    });
+
+    it("同一 PR で full 稼働中に ci_script_hazard の新コミットへ遷移したら既存 Sandbox を即座に破棄する", async () => {
+      sandboxTestConfig.hangCommand = "sleep 999";
+      faux.setResponses([
+        toolCall("exec", { command: "sleep 999" }),
+        fauxAssistantMessage(fauxText("到達しない")),
+      ]);
+
+      const stub = env.ORCHESTRATOR.getByName("octo/repo#1024");
+      await stub.start(
+        withHeadSha({
+          ...request,
+          deliveryId: "del-full-active",
+          pullNumber: 1024,
+          headSha: "sha-full-1",
+        }),
+      );
+      await vi.waitFor(() => {
+        expect(executed).toContain("sleep 999");
+      });
+      expect(destroyedSandboxes).toHaveLength(0);
+
+      // 次コミットで postinstall 改ざんが入り static_only へ遷移
+      mockGitHub.headSha = "sha-static-2";
+      mockGitHub.diff = [
+        "diff --git a/package.json b/package.json",
+        "--- a/package.json",
+        "+++ b/package.json",
+        "@@ -1,2 +1,3 @@",
+        ' "scripts": {',
+        '+  "postinstall": "node ./evil.js"',
+        " }",
+      ].join("\n");
+      faux.setResponses([fauxAssistantMessage(fauxText("static_only 切替後完了"))]);
+
+      const nextReceipt = await stub.start({
+        ...request,
+        deliveryId: "del-static-next",
+        pullNumber: 1024,
+        headSha: "sha-static-2",
+        action: "synchronize",
+      });
+      expect(nextReceipt).toMatchObject({ executionMode: "static_only", stage: "primary_review" });
+      expect(destroyedSandboxes).toHaveLength(1);
+      await expect(stub.result("del-static-next")).resolves.toMatchObject({
+        status: "done",
+        text: "static_only 切替後完了",
+      });
+    });
+
+    it("ciDiscoveryGraceMs > 0 かつ初期チェック 0 件のときはグレース待機後に CI 登録またはフォールバックへ遷移する", async () => {
+      mockGitHub.headSha = "sha-grace-1";
+      mockGitHub.defaultPassingCi = false;
+      sandboxTestConfig.ciDiscoveryGraceMs = 40;
+      sandboxTestConfig.ciPollIntervalMs = 40;
+      sandboxTestConfig.ciWaitTimeoutMs = 500;
+      faux.setResponses([fauxAssistantMessage(fauxText("グレース後フォールバック完了"))]);
+
+      const stub = env.ORCHESTRATOR.getByName("octo/repo#1025");
+      const receipt = await stub.start({
+        ...request,
+        deliveryId: "del-grace-1",
+        pullNumber: 1025,
+        headSha: "sha-grace-1",
+      });
+      expect(receipt).toMatchObject({ accepted: true, stage: "awaiting_ci" });
+
+      // グレース期間内に CI が登録されないまま経過 -> Sandbox フォールバックでレビュー完了
+      const outcome = await stub.result("del-grace-1");
+      expect(outcome).toMatchObject({ status: "done", text: "グレース後フォールバック完了" });
+      const state = await stub.step1Status("del-grace-1");
+      expect(state?.testReport?.source).toBe("sandbox");
+    });
   });
 });
 

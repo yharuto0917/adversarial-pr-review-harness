@@ -3,10 +3,10 @@
  * ここに Cloudflare 固有の型を持ち込まないこと（harness の移植性を保つため）。
  *
  * セッションの永続化・コンテキスト組み立て・ループ制御は Pi (pi-durable) が担うので、
- * ここに残るのは Pi のツールが呼び出す先だけ。
+ * ここに残るのは Pi のツールや決定論的ステップが呼び出す先だけ。
  */
 
-import type { Finding } from "@repo/review-core";
+import type { ExecutionMode, Finding } from "@repo/review-core";
 
 export interface ExecResult {
   readonly stdout: string;
@@ -66,10 +66,180 @@ export interface SandboxService {
   destroy(sandboxId: string): Promise<void>;
 }
 
-/** GitHub への出口。 */
-export interface GitHubPort {
-  getDiff(): Promise<string>;
-  postReview(body: string): Promise<void>;
+/** `static_only` モード中に禁止操作（setupProject / exec / writeFile）を試みた際のエラー。 */
+export class StaticOnlyPolicyError extends Error {
+  readonly operation: "setupProject" | "exec" | "writeFile";
+
+  constructor(operation: "setupProject" | "exec" | "writeFile", reason?: string) {
+    super(
+      `sandbox.${operation} is prohibited in static_only execution mode${reason ? ` (${reason})` : ""}`,
+    );
+    this.name = "StaticOnlyPolicyError";
+    this.operation = operation;
+  }
+}
+
+export interface DiffRange {
+  readonly base: string;
+  readonly head: string;
+}
+
+export interface PullRequestMeta {
+  readonly number: number;
+  readonly state: "open" | "closed";
+  readonly draft: boolean;
+  readonly title: string;
+  readonly body: string | null;
+  readonly authorLogin: string | null;
+  readonly baseSha: string;
+  readonly headSha: string;
+  readonly baseRef: string;
+  readonly headRef: string;
+  readonly defaultBranch: string;
+  readonly baseRepoId: number | null;
+  readonly headRepoId: number | null;
+  readonly baseRepoFullName: string | null;
+  readonly headRepoFullName: string | null;
+  readonly isFork: boolean;
+}
+
+export interface PullRequestFileEntry {
+  readonly filename: string;
+  readonly previousFilename?: string | undefined;
+  readonly status: string;
+  readonly additions: number;
+  readonly deletions: number;
+  readonly changes: number;
+  readonly patch?: string | undefined;
+}
+
+export interface PullRequestFilesResult {
+  readonly files: readonly PullRequestFileEntry[];
+  readonly truncated: boolean;
+}
+
+export interface CheckAnnotation {
+  readonly path: string;
+  readonly startLine: number;
+  readonly endLine: number;
+  readonly annotationLevel: string;
+  readonly title: string | null;
+  readonly message: string;
+}
+
+export type CommitCheckStatus = "queued" | "in_progress" | "completed";
+
+export type CommitCheckConclusion =
+  | "success"
+  | "failure"
+  | "neutral"
+  | "cancelled"
+  | "skipped"
+  | "timed_out"
+  | "action_required"
+  | "stale"
+  | "startup_failure"
+  | "error";
+
+export interface CommitCheckItem {
+  readonly source: "check_run" | "commit_status";
+  readonly id?: number | undefined;
+  readonly name: string;
+  readonly appId: number | null;
+  readonly appSlug: string | null;
+  readonly status: CommitCheckStatus;
+  readonly conclusion: CommitCheckConclusion | null;
+  readonly detailsUrl: string | null;
+  readonly title: string | null;
+  readonly summary: string | null;
+  readonly text: string | null;
+  readonly annotations: readonly CheckAnnotation[];
+  readonly completedAt: string | null;
+}
+
+export interface CommitCheckSuiteItem {
+  readonly id: number;
+  readonly appId: number | null;
+  readonly appSlug: string | null;
+  readonly status: CommitCheckStatus;
+  readonly conclusion: CommitCheckConclusion | null;
+}
+
+export interface CommitChecksSnapshot {
+  readonly headSha: string;
+  readonly checks: readonly CommitCheckItem[];
+  readonly checkSuites: readonly CommitCheckSuiteItem[];
+  readonly truncated: boolean;
+}
+
+export interface ReviewThreadComment {
+  readonly id: string;
+  readonly body: string;
+  readonly authorLogin: string | null;
+  readonly createdAt: string | null;
+  readonly url: string | null;
+}
+
+export interface ReviewThread {
+  readonly id: string;
+  readonly isResolved: boolean;
+  readonly isOutdated: boolean;
+  readonly path: string | null;
+  readonly line: number | null;
+  readonly originalLine: number | null;
+  readonly startLine: number | null;
+  readonly diffSide: "LEFT" | "RIGHT" | null;
+  readonly body: string;
+  readonly fingerprint: string | null;
+  readonly comments: readonly ReviewThreadComment[];
+}
+
+export interface ReviewThreadsResult {
+  readonly threads: readonly ReviewThread[];
+  readonly truncated: boolean;
+}
+
+export type ReviewEvent = "COMMENT" | "REQUEST_CHANGES" | "APPROVE";
+
+export interface ReviewInlineComment {
+  readonly path: string;
+  readonly line: number;
+  readonly side?: "LEFT" | "RIGHT" | undefined;
+  readonly startLine?: number | undefined;
+  readonly startSide?: "LEFT" | "RIGHT" | undefined;
+  readonly body: string;
+}
+
+export interface PostReviewInput {
+  readonly commitId?: string | undefined;
+  readonly event?: ReviewEvent | undefined;
+  readonly body: string;
+  readonly comments?: readonly ReviewInlineComment[] | undefined;
+}
+
+export interface PostReviewResult {
+  readonly id: number | null;
+}
+
+/**
+ * Agent ツールおよび Step 0 / 1 から利用可能な Read 専用 GitHub ポート。
+ * Write 操作（`postReview` / `resolveThread`）はここには含めず、`GitHubWritePort` へ分離する。
+ */
+export interface GitHubReadPort {
+  getPullRequestMeta(): Promise<PullRequestMeta>;
+  getDiff(range?: DiffRange): Promise<string>;
+  listPullRequestFiles(): Promise<PullRequestFilesResult>;
+  getCommitChecks(headSha: string): Promise<CommitChecksSnapshot>;
+  listReviewThreads(): Promise<ReviewThreadsResult>;
+  getFileContent(path: string, ref: string): Promise<string | null>;
+}
+
+/** Agent ツールに露出する GitHub ポートは Read 専用に限定する。 */
+export type GitHubPort = GitHubReadPort;
+
+/** Orchestrator 専用の GitHub Write ポート。`HarnessPorts` / Agent ツールには渡さない。 */
+export interface GitHubWritePort {
+  postReview(input: PostReviewInput): Promise<PostReviewResult>;
   resolveThread(threadId: string): Promise<void>;
 }
 
@@ -84,7 +254,7 @@ export interface FindingsPort {
   report(finding: FindingDraft): Promise<void>;
 }
 
-/** ツールが依存するポートの束。 */
+/** ツールが依存するポートの束（GitHub は Read 専用のみ）。 */
 export interface HarnessPorts {
   readonly sandbox: SandboxPort;
   readonly github: GitHubPort;
@@ -113,5 +283,32 @@ export function bindSandbox(
     readFile: (path) => service.readFile(sandboxId, path),
     writeFile: (path, content) => service.writeFile(sandboxId, path, content),
     listFiles: (path) => service.listFiles(sandboxId, path),
+  };
+}
+
+/**
+ * 実行モード（`full` / `static_only`）を動的に評価し、`static_only` 時は
+ * `exec` / `writeFile` を機械的に遮断する `SandboxPort` ラッパーを作る。
+ */
+export function guardSandboxPort(
+  sandbox: SandboxPort,
+  getExecutionMode: () => ExecutionMode,
+  getReason?: () => string | undefined,
+): SandboxPort {
+  return {
+    exec: async (command, options) => {
+      if (getExecutionMode() === "static_only") {
+        throw new StaticOnlyPolicyError("exec", getReason?.());
+      }
+      return sandbox.exec(command, options);
+    },
+    readFile: (path) => sandbox.readFile(path),
+    writeFile: async (path, content) => {
+      if (getExecutionMode() === "static_only") {
+        throw new StaticOnlyPolicyError("writeFile", getReason?.());
+      }
+      return sandbox.writeFile(path, content);
+    },
+    listFiles: (path) => sandbox.listFiles(path),
   };
 }

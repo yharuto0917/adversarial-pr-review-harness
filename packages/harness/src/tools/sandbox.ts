@@ -1,5 +1,6 @@
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ToolRegistration } from "@earendil-works/pi-durable";
+import type { ExecutionMode } from "@repo/review-core";
 
 import type { SandboxPort } from "../ports.js";
 import { text } from "./result.js";
@@ -10,11 +11,46 @@ const READ_OUTPUT_LIMITS = { maxBytes: 64_000, maxLines: 1_500, retain: "head" }
 const MIN_TOOL_EXEC_TIMEOUT_SECONDS = 1;
 const MAX_TOOL_EXEC_TIMEOUT_SECONDS = 120;
 
+export interface CreateSandboxToolsOptions {
+  /** `static_only` 指定時は `exec` / `write_file` をツール登録から除外する。 */
+  readonly executionMode?: ExecutionMode | undefined;
+}
+
 /**
  * fs / shell 操作をモデル向けツールとして露出する。
  * `replay` は中断後に再実行してよいかの宣言で、副作用が読めない `exec` だけ既定（再実行しない）のままにする。
  */
-export function createSandboxTools(sandbox: SandboxPort): ToolRegistration[] {
+export function createSandboxTools(
+  sandbox: SandboxPort,
+  options?: CreateSandboxToolsOptions,
+): ToolRegistration[] {
+  const readFile = defineTool({
+    name: "read_file",
+    description: "サンドボックス内のファイルをテキストとして読む。",
+    parameters: Type.Object({ path: Type.String({ minLength: 1 }) }),
+    replay: "safe",
+    outputLimits: READ_OUTPUT_LIMITS,
+    async execute({ path }) {
+      return text(await sandbox.readFile(path));
+    },
+  });
+
+  const listFiles = defineTool({
+    name: "list_files",
+    description: "サンドボックス内のディレクトリ直下にあるファイルを列挙する。",
+    parameters: Type.Object({ path: Type.String({ minLength: 1 }) }),
+    replay: "safe",
+    outputLimits: READ_OUTPUT_LIMITS,
+    async execute({ path }) {
+      const files = await sandbox.listFiles(path);
+      return text(files.length > 0 ? files.join("\n") : "(empty)");
+    },
+  });
+
+  if (options?.executionMode === "static_only") {
+    return [readFile, listFiles] as ToolRegistration[];
+  }
+
   const exec = defineTool({
     name: "exec",
     description:
@@ -48,17 +84,6 @@ export function createSandboxTools(sandbox: SandboxPort): ToolRegistration[] {
     },
   });
 
-  const readFile = defineTool({
-    name: "read_file",
-    description: "サンドボックス内のファイルをテキストとして読む。",
-    parameters: Type.Object({ path: Type.String({ minLength: 1 }) }),
-    replay: "safe",
-    outputLimits: READ_OUTPUT_LIMITS,
-    async execute({ path }) {
-      return text(await sandbox.readFile(path));
-    },
-  });
-
   const writeFile = defineTool({
     name: "write_file",
     description:
@@ -69,18 +94,6 @@ export function createSandboxTools(sandbox: SandboxPort): ToolRegistration[] {
     async execute({ path, content }) {
       await sandbox.writeFile(path, content);
       return text(`wrote ${path}`);
-    },
-  });
-
-  const listFiles = defineTool({
-    name: "list_files",
-    description: "サンドボックス内のディレクトリ直下にあるファイルを列挙する。",
-    parameters: Type.Object({ path: Type.String({ minLength: 1 }) }),
-    replay: "safe",
-    outputLimits: READ_OUTPUT_LIMITS,
-    async execute({ path }) {
-      const files = await sandbox.listFiles(path);
-      return text(files.length > 0 ? files.join("\n") : "(empty)");
     },
   });
 

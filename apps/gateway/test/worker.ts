@@ -3,6 +3,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import type { ExecResult, SandboxExecOptions, SandboxService } from "@repo/harness";
 import { ReviewOrchestrator as ProductionOrchestrator } from "@repo/orchestrator";
+import type { PartialRepoReviewConfig } from "@repo/review-core";
 
 export { CredentialVault, default } from "../src/index.js";
 export { ProductionOrchestrator };
@@ -26,7 +27,7 @@ export const sandboxFiles = new Map<string, Map<string, string>>();
 /** destroy() が成功した sandboxId の記録。 */
 export const destroyedSandboxes: string[] = [];
 
-/** テストから破棄失敗・ハング・タイムアウト・TTL 短縮を注入するための設定。 */
+/** テストから破棄失敗・ハング・タイムアウト・TTL・Step 1 CI 待機設定を注入するための設定。 */
 export const sandboxTestConfig = {
   destroyFailuresRemaining: 0,
   destroyHangCount: 0,
@@ -38,6 +39,11 @@ export const sandboxTestConfig = {
   cleanupPollMs: null as number | null,
   destroyRetryBaseDelayMs: null as number | null,
   destroyTimeoutMs: null as number | null,
+  ciPollIntervalMs: null as number | null,
+  ciWaitTimeoutMs: null as number | null,
+  ciDiscoveryGraceMs: 0 as number | null,
+  managedRepoConfig: null as PartialRepoReviewConfig | null,
+  failTestCommands: false,
 };
 
 const sandboxDestroyCounts = new Map<string, number>();
@@ -126,6 +132,13 @@ export class SandboxEntrypoint extends WorkerEntrypoint implements SandboxServic
       return { stdout: `installed via ${command}`, stderr: "", exitCode: 0 };
     }
     if (TEST_COMMAND_PATTERN.test(command) && filesOf(sandboxId).has("node_modules/.installed")) {
+      if (sandboxTestConfig.failTestCommands) {
+        return {
+          stdout: "",
+          stderr: `FAIL (${command}): AssertionError`,
+          exitCode: 1,
+        };
+      }
       return {
         stdout: `PASS (${command})`,
         stderr: "",
@@ -133,8 +146,6 @@ export class SandboxEntrypoint extends WorkerEntrypoint implements SandboxServic
       };
     }
     if (sandboxTestConfig.hangCommand !== null && command === sandboxTestConfig.hangCommand) {
-      // Workers の cross-request I/O 制限に抵触しないよう、別リクエストから reject を直接呼ばず
-      // 同一リクエストコンテキスト内のタイマーで destroy カウンタ変化を監視する
       const destroyCountAtStart = sandboxDestroyCounts.get(sandboxId) ?? 0;
       return new Promise<ExecResult>((_resolve, reject) => {
         const timer = setInterval(() => {
@@ -210,5 +221,24 @@ export class ReviewOrchestrator extends ProductionOrchestrator {
 
   protected override sandboxDestroyTimeoutMs(): number {
     return sandboxTestConfig.destroyTimeoutMs ?? super.sandboxDestroyTimeoutMs();
+  }
+
+  protected override ciPollIntervalMs(): number {
+    return sandboxTestConfig.ciPollIntervalMs ?? super.ciPollIntervalMs();
+  }
+
+  protected override ciWaitTimeoutMs(): number {
+    return sandboxTestConfig.ciWaitTimeoutMs ?? super.ciWaitTimeoutMs();
+  }
+
+  protected override ciDiscoveryGraceMs(): number {
+    return sandboxTestConfig.ciDiscoveryGraceMs ?? super.ciDiscoveryGraceMs();
+  }
+
+  protected override managedRepoConfig(repository: string): Promise<PartialRepoReviewConfig> {
+    if (sandboxTestConfig.managedRepoConfig !== null) {
+      return Promise.resolve(sandboxTestConfig.managedRepoConfig);
+    }
+    return super.managedRepoConfig(repository);
   }
 }
