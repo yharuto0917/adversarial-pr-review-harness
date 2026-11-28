@@ -1,43 +1,26 @@
 /** GitHub App の署名検証・installation token 発行・PR 操作クライアント。 */
 
-export interface AppCredentials {
-  readonly appId: string;
-  readonly privateKey: string;
-  readonly installationId: number;
-}
+import {
+  GITHUB_API_BASE,
+  GITHUB_API_VERSION,
+  GITHUB_USER_AGENT,
+  sanitizeGitHubErrorBody,
+} from "./client.js";
+import {
+  type AppCredentials,
+  GitHubApiError,
+  type GitHubPermissionLevel,
+  type InstallationTokenScope,
+} from "./types.js";
 
-export type GitHubPermissionLevel = "read" | "write";
-
-export interface InstallationTokenScope {
-  /**
-   * トークンのアクセス対象を限定するリポジトリ名（`owner/` を含めないリポジトリ名のみ）。
-   * GitHub REST API (`POST /app/installations/{installation_id}/access_tokens`) の仕様に従う。
-   */
-  readonly repositories?: readonly string[];
-  /** トークンに付与する権限の絞り込み（例: `{ contents: "read" }`）。 */
-  readonly permissions?: Readonly<Record<string, GitHubPermissionLevel>>;
-}
-
-export interface PullRequestClientOptions {
-  /** `owner/name` 形式。 */
-  readonly repository: string;
-  readonly pullNumber: number;
-  /** 都度（またはキャッシュ経由で）installation token を返す関数。 */
-  readonly getToken: () => Promise<string>;
-}
-
-export interface PullRequestClient {
-  getDiff(): Promise<string>;
-  postReview(body: string): Promise<void>;
-  resolveThread(threadId: string): Promise<void>;
-}
-
-const GITHUB_API_BASE = "https://api.github.com";
-const GITHUB_API_VERSION = "2022-11-28";
-const USER_AGENT = "adversarial-pr-review-harness";
+export * from "./client.js";
+export * from "./types.js";
 
 /** 有効期限ギリギリのトークンを使わないための安全マージン（60 秒）。 */
 const TOKEN_EXPIRY_MARGIN_MS = 60_000;
+
+/** オンメモリトークンキャッシュの上限件数。 */
+const MAX_TOKEN_CACHE_ENTRIES = 500;
 
 interface CachedToken {
   readonly token: string;
@@ -102,7 +85,7 @@ export async function issueInstallationToken(
     Authorization: `Bearer ${jwt}`,
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": GITHUB_API_VERSION,
-    "User-Agent": USER_AGENT,
+    "User-Agent": GITHUB_USER_AGENT,
   };
   let body: string | undefined;
   if (normalizedScope !== undefined) {
@@ -119,19 +102,50 @@ export async function issueInstallationToken(
     },
   );
   if (!response.ok) {
-    const errorBody = await response.text().catch(() => "");
-    throw new Error(`failed to issue installation token (${response.status}): ${errorBody}`);
+    const errorBody = sanitizeGitHubErrorBody(await response.text().catch(() => ""));
+    const code =
+      response.status === 401 || response.status === 403 || response.status === 422
+        ? "GITHUB_PERMISSION_DENIED"
+        : "GITHUB_API_ERROR";
+    throw new GitHubApiError(
+      code,
+      response.status,
+      `failed to issue installation token (${response.status}): ${errorBody}`,
+    );
   }
 
   const data = (await response.json()) as { token?: unknown; expires_at?: unknown };
   if (typeof data.token !== "string" || data.token.length === 0) {
-    throw new Error("installation token response is missing token");
+    throw new GitHubApiError(
+      "GITHUB_INVALID_RESPONSE",
+      response.status,
+      "installation token response is missing token",
+    );
   }
   const expiresAt = typeof data.expires_at === "string" ? Date.parse(data.expires_at) : Number.NaN;
   if (Number.isFinite(expiresAt)) {
+    evictExpiredOrOverflowCache(now);
     tokenCache.set(cacheKey, { token: data.token, expiresAt });
   }
   return data.token;
+}
+
+function evictExpiredOrOverflowCache(now: number): void {
+  if (tokenCache.size < MAX_TOKEN_CACHE_ENTRIES) {
+    return;
+  }
+  for (const [key, entry] of tokenCache.entries()) {
+    if (entry.expiresAt - TOKEN_EXPIRY_MARGIN_MS <= now) {
+      tokenCache.delete(key);
+    }
+  }
+  while (tokenCache.size >= MAX_TOKEN_CACHE_ENTRIES) {
+    const oldestKey = tokenCache.keys().next().value;
+    if (oldestKey === undefined) {
+      break;
+    }
+    tokenCache.delete(oldestKey);
+  }
 }
 
 interface NormalizedTokenScope {
@@ -232,83 +246,6 @@ export async function verifyWebhookSignature(
   );
   const actual = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(payload)));
   return timingSafeEqualBytes(actual, expected);
-}
-
-/**
- * PR に対する差分取得・レビュー投稿・スレッド解決を行うクライアントを作る。
- */
-export function createPullRequestClient(options: PullRequestClientOptions): PullRequestClient {
-  return {
-    async getDiff(): Promise<string> {
-      const token = await options.getToken();
-      const response = await fetch(
-        `${GITHUB_API_BASE}/repos/${options.repository}/pulls/${options.pullNumber}`,
-        {
-          method: "GET",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Accept: "application/vnd.github.v3.diff",
-            "X-GitHub-Api-Version": GITHUB_API_VERSION,
-            "User-Agent": USER_AGENT,
-          },
-        },
-      );
-      if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        throw new Error(`failed to get pull request diff (${response.status}): ${text}`);
-      }
-      return response.text();
-    },
-
-    async postReview(body: string): Promise<void> {
-      const token = await options.getToken();
-      const response = await fetch(
-        `${GITHUB_API_BASE}/repos/${options.repository}/pulls/${options.pullNumber}/reviews`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Accept: "application/vnd.github+json",
-            "Content-Type": "application/json",
-            "X-GitHub-Api-Version": GITHUB_API_VERSION,
-            "User-Agent": USER_AGENT,
-          },
-          body: JSON.stringify({ body, event: "COMMENT" }),
-        },
-      );
-      if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        throw new Error(`failed to post pull request review (${response.status}): ${text}`);
-      }
-    },
-
-    async resolveThread(threadId: string): Promise<void> {
-      const token = await options.getToken();
-      const response = await fetch(`${GITHUB_API_BASE}/graphql`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/vnd.github+json",
-          "Content-Type": "application/json",
-          "User-Agent": USER_AGENT,
-        },
-        body: JSON.stringify({
-          query:
-            "mutation($threadId: ID!) { resolveReviewThread(input: { threadId: $threadId }) { thread { id isResolved } } }",
-          variables: { threadId },
-        }),
-      });
-      if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        throw new Error(`failed to resolve review thread (${response.status}): ${text}`);
-      }
-      const result = (await response.json()) as { errors?: Array<{ message?: string }> };
-      if (result.errors && result.errors.length > 0) {
-        const message = result.errors.map((e) => e.message ?? "GraphQL error").join("; ");
-        throw new Error(`failed to resolve review thread: ${message}`);
-      }
-    },
-  };
 }
 
 function timingSafeEqualBytes(a: Uint8Array, b: Uint8Array): boolean {
