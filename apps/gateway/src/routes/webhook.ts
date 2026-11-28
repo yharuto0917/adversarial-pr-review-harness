@@ -6,12 +6,12 @@ const SAFE_REPOSITORY = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*
 const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
 /** Webhook ペイロードの最大許容バイト数（2 MiB）。 */
-const MAX_WEBHOOK_BODY_BYTES = 2 * 1024 * 1024;
+export const MAX_WEBHOOK_BODY_BYTES = 2 * 1024 * 1024;
 
 /** 1 回の `check_suite.completed` で通知する PR 上限件数（サブリクエスト枯渇防止）。 */
-const MAX_CHECK_SUITE_PULL_REQUESTS = 20;
+export const MAX_CHECK_SUITE_PULL_REQUESTS = 20;
 
-interface WebhookRepoRef {
+export interface WebhookRepoRef {
   readonly id?: unknown;
   readonly full_name?: unknown;
   readonly default_branch?: unknown;
@@ -309,7 +309,7 @@ async function handleCheckSuiteWebhook(
  * `head.repo === null`（削除済みフォーク）は `true`、`base.repo` と `head.repo` の両方が
  * 正の id と full_name で一致した場合のみ `false`。情報欠落時は `undefined` として Step 0 へ委ねる。
  */
-function resolveWebhookIsFork(
+export function resolveWebhookIsFork(
   baseRepo: WebhookRepoRef | null | undefined,
   headRepo: WebhookRepoRef | null | undefined,
 ): boolean | undefined {

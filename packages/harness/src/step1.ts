@@ -579,7 +579,7 @@ export async function runSandboxDeterministicTests(
         ...(input.baseSha !== undefined ? { baseSha: input.baseSha } : {}),
         executionMode: "full",
         source: existingCiChecks.length > 0 ? "mixed" : "sandbox",
-        overallStatus: isTimeout ? "timed_out" : "failed",
+        overallStatus: computeOverallStatus(allChecks, "sandbox"),
         hasRegressionFailure: decision.hasRegressionFailure,
         shouldEarlyReject: decision.shouldEarlyReject,
         ...(decision.shouldEarlyReject && decision.earlyRejectReason !== undefined

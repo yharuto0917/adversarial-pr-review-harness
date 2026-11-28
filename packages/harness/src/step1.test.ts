@@ -429,4 +429,241 @@ describe("runSandboxDeterministicTests", () => {
     expect(result.report.earlyRejectReason).toContain("pnpm test");
     expect(() => testExecutionReportSchema.parse(result.report)).not.toThrow();
   });
+
+  it("依存セットアップが失敗した場合は project-setup (failed) を記録し、earlyRejectPolicy に従って判定する", async () => {
+    const sandbox: SandboxPort = {
+      listFiles: async () => ["package.json", "pnpm-lock.yaml"],
+      readFile: async () => JSON.stringify({ name: "broken", scripts: { test: "vitest run" } }),
+      writeFile: async () => {},
+      exec: async () => ({
+        stdout: "",
+        stderr: "ERR_PNPM_FETCH_404 registry error",
+        exitCode: 1,
+      }),
+    };
+
+    const existingCiChecks = [
+      {
+        name: "CI / test",
+        kind: "test" as const,
+        source: "ci" as const,
+        status: "skipped" as const,
+      },
+    ];
+
+    const onFail = await runSandboxDeterministicTests(sandbox, {
+      headSha: "head1",
+      baseSha: "base1",
+      executionMode: "full",
+      earlyRejectPolicy: "on_test_failure",
+      existingCiChecks,
+    });
+    expect(onFail.detectedTestCommands).toEqual([]);
+    expect(onFail.report.source).toBe("mixed");
+    expect(onFail.report.overallStatus).toBe("failed");
+    expect(onFail.report.hasRegressionFailure).toBe(true);
+    expect(onFail.report.shouldEarlyReject).toBe(true);
+    expect(onFail.report.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "project-setup",
+          kind: "build",
+          source: "sandbox",
+          status: "failed",
+        }),
+      ]),
+    );
+    expect(() => testExecutionReportSchema.parse(onFail.report)).not.toThrow();
+
+    const neverRes = await runSandboxDeterministicTests(sandbox, {
+      headSha: "head1",
+      executionMode: "full",
+      earlyRejectPolicy: "never",
+    });
+    expect(neverRes.report.source).toBe("sandbox");
+    expect(neverRes.report.overallStatus).toBe("failed");
+    expect(neverRes.report.hasRegressionFailure).toBe(true);
+    expect(neverRes.report.shouldEarlyReject).toBe(false);
+    expect(() => testExecutionReportSchema.parse(neverRes.report)).not.toThrow();
+  });
+
+  it("依存セットアップがタイムアウトした場合は project-setup (timed_out) を記録し、strict のみ early_rejected にする", async () => {
+    const sandbox: SandboxPort = {
+      listFiles: async () => ["package.json", "pnpm-lock.yaml"],
+      readFile: async () => JSON.stringify({ name: "slow", scripts: { test: "vitest run" } }),
+      writeFile: async () => {},
+      exec: async () => ({
+        stdout: "",
+        stderr: "command timed out after 120000ms",
+        exitCode: 124,
+        timedOut: true,
+      }),
+    };
+
+    const onFail = await runSandboxDeterministicTests(sandbox, {
+      headSha: "head1",
+      executionMode: "full",
+      earlyRejectPolicy: "on_test_failure",
+    });
+    expect(onFail.detectedTestCommands).toEqual([]);
+    expect(onFail.report.overallStatus).toBe("timed_out");
+    expect(onFail.report.hasRegressionFailure).toBe(false);
+    expect(onFail.report.shouldEarlyReject).toBe(false);
+    expect(onFail.report.checks[0]).toMatchObject({
+      name: "project-setup",
+      kind: "build",
+      source: "sandbox",
+      status: "timed_out",
+    });
+    expect(() => testExecutionReportSchema.parse(onFail.report)).not.toThrow();
+
+    const strict = await runSandboxDeterministicTests(sandbox, {
+      headSha: "head1",
+      executionMode: "full",
+      earlyRejectPolicy: "strict",
+    });
+    expect(strict.report.overallStatus).toBe("timed_out");
+    expect(strict.report.hasRegressionFailure).toBe(false);
+    expect(strict.report.shouldEarlyReject).toBe(true);
+    expect(strict.report.earlyRejectReason).toContain("project-setup");
+    expect(() => testExecutionReportSchema.parse(strict.report)).not.toThrow();
+  });
+
+  it("検出されたテストコマンドが 0 件の場合は project-tests (not_configured) と overallStatus=skipped を返す", async () => {
+    const execCalls: string[] = [];
+    const sandbox: SandboxPort = {
+      listFiles: async () => ["README.md"],
+      readFile: async () => "# docs only",
+      writeFile: async () => {},
+      exec: async (cmd) => {
+        execCalls.push(cmd);
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+    };
+
+    const result = await runSandboxDeterministicTests(sandbox, {
+      headSha: "head1",
+      executionMode: "full",
+      earlyRejectPolicy: "strict",
+    });
+
+    expect(execCalls).toEqual([]);
+    expect(result.detectedTestCommands).toEqual([]);
+    expect(result.report.source).toBe("sandbox");
+    expect(result.report.overallStatus).toBe("skipped");
+    expect(result.report.hasRegressionFailure).toBe(false);
+    expect(result.report.shouldEarlyReject).toBe(false);
+    expect(result.report.checks).toEqual([
+      expect.objectContaining({
+        name: "project-tests",
+        kind: "test",
+        source: "sandbox",
+        status: "not_configured",
+      }),
+    ]);
+    expect(() => testExecutionReportSchema.parse(result.report)).not.toThrow();
+  });
+
+  it("テストコマンド実行が timedOut を返した場合は timed_out として記録し、on_test_failure / never では継続・strict で差し戻す", async () => {
+    const sandbox: SandboxPort = {
+      listFiles: async () => [],
+      readFile: async () => "",
+      writeFile: async () => {},
+      exec: async () => ({
+        stdout: "",
+        stderr: "test execution timed out",
+        exitCode: 124,
+        timedOut: true,
+      }),
+    };
+
+    for (const policy of ["on_test_failure", "never", "strict"] as const) {
+      const result = await runSandboxDeterministicTests(sandbox, {
+        headSha: "head1",
+        executionMode: "full",
+        earlyRejectPolicy: policy,
+        preDetectedTestCommands: ["pnpm test"],
+      });
+      expect(result.report.overallStatus).toBe("timed_out");
+      expect(result.report.hasRegressionFailure).toBe(false);
+      expect(result.report.shouldEarlyReject).toBe(policy === "strict");
+      expect(result.report.checks[0]).toMatchObject({
+        name: "pnpm test",
+        kind: "test",
+        source: "sandbox",
+        status: "timed_out",
+        exitCode: 124,
+      });
+      expect(() => testExecutionReportSchema.parse(result.report)).not.toThrow();
+    }
+  });
+
+  it("preDetectedTestCommands を渡した場合は setupProject をスキップして二重初期化せず、指定コマンドのみ実行する", async () => {
+    const installCalled: string[] = [];
+    const execCalls: Array<{ cmd: string; timeoutMs: number | undefined }> = [];
+
+    const installSandbox: SandboxPort = {
+      listFiles: async () => {
+        installCalled.push("listFiles");
+        return ["package.json"];
+      },
+      readFile: async () => {
+        installCalled.push("readFile");
+        return "{}";
+      },
+      writeFile: async () => {
+        installCalled.push("writeFile");
+      },
+      exec: async (cmd) => {
+        installCalled.push(`exec:${cmd}`);
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+    };
+
+    const lockedSandbox: SandboxPort = {
+      listFiles: async () => {
+        installCalled.push("locked:listFiles");
+        return [];
+      },
+      readFile: async () => {
+        installCalled.push("locked:readFile");
+        return "";
+      },
+      writeFile: async () => {},
+      exec: async (cmd, opts) => {
+        execCalls.push({ cmd, timeoutMs: opts?.timeoutMs });
+        return { stdout: "all passed", stderr: "", exitCode: 0 };
+      },
+    };
+
+    const result = await runSandboxDeterministicTests(lockedSandbox, {
+      headSha: "head1",
+      baseSha: "base1",
+      executionMode: "full",
+      earlyRejectPolicy: "on_test_failure",
+      installSandbox,
+      preDetectedTestCommands: ["pnpm test", "pnpm run typecheck"],
+      commandTimeoutMs: 45_000,
+      existingCiChecks: [
+        {
+          name: "CI / lint",
+          kind: "lint",
+          source: "ci",
+          status: "skipped",
+        },
+      ],
+    });
+
+    expect(installCalled).toEqual([]);
+    expect(execCalls).toEqual([
+      { cmd: "pnpm test", timeoutMs: 45_000 },
+      { cmd: "pnpm run typecheck", timeoutMs: 45_000 },
+    ]);
+    expect(result.detectedTestCommands).toEqual(["pnpm test", "pnpm run typecheck"]);
+    expect(result.report.source).toBe("mixed");
+    expect(result.report.overallStatus).toBe("passed");
+    expect(result.report.hasRegressionFailure).toBe(false);
+    expect(result.report.shouldEarlyReject).toBe(false);
+    expect(() => testExecutionReportSchema.parse(result.report)).not.toThrow();
+  });
 });

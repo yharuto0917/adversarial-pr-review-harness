@@ -3,6 +3,11 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import { clearInstallationTokenCache } from "@repo/github";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  MAX_CHECK_SUITE_PULL_REQUESTS,
+  MAX_WEBHOOK_BODY_BYTES,
+  resolveWebhookIsFork,
+} from "../src/routes/webhook.js";
 import { destroyedSandboxes, executed, faux, sandboxFiles, sandboxTestConfig } from "./worker.js";
 
 const WEBHOOK_SECRET = "test-webhook-secret";
@@ -526,5 +531,282 @@ describe("POST /webhook/github", () => {
       body: invalidJson,
     });
     expect(badJsonRes.status).toBe(400);
+  });
+
+  it("外部フォーク判定の fail-closed ケース（head=null / id 不一致 / full_name 不一致 / 判定材料欠落）で isFork: true を伝播し static_only に強制する", async () => {
+    const cases = [
+      {
+        label: "head.repo が null（削除済みフォーク）",
+        pullNumber: 601,
+        sha: "sha-fork-null",
+        baseRepo: { id: 100, full_name: "octo/repo", default_branch: "main" },
+        headRepo: null,
+      },
+      {
+        label: "base/head の id 不一致",
+        pullNumber: 602,
+        sha: "sha-fork-id",
+        baseRepo: { id: 100, full_name: "octo/repo", default_branch: "main" },
+        headRepo: { id: 200, full_name: "octo/repo", default_branch: "main" },
+      },
+      {
+        label: "base/head の full_name 不一致",
+        pullNumber: 603,
+        sha: "sha-fork-name",
+        baseRepo: { id: 100, full_name: "octo/repo", default_branch: "main" },
+        headRepo: { id: 100, full_name: "external/repo", default_branch: "main" },
+      },
+      {
+        label: "判定材料欠落（head.repo.id 欠落）",
+        pullNumber: 604,
+        sha: "sha-fork-missing",
+        baseRepo: { id: 100, full_name: "octo/repo", default_branch: "main" },
+        headRepo: { full_name: "octo/repo", default_branch: "main" },
+      },
+      {
+        label: "通常の外部フォーク PR",
+        pullNumber: 605,
+        sha: "sha-fork-standard",
+        baseRepo: { id: 100, full_name: "octo/repo", default_branch: "main" },
+        headRepo: { id: 200, full_name: "external/repo", default_branch: "main" },
+      },
+    ] as const;
+
+    // GitHub API 側のメタはあえて isFork: false にし、Webhook の isFork: true 伝播のみで static_only になることを検証する
+    installDefaultGitHubMock({
+      headShaByPull: Object.fromEntries(cases.map((tc) => [tc.pullNumber, tc.sha])),
+      isForkByPull: Object.fromEntries(cases.map((tc) => [tc.pullNumber, false])),
+    });
+
+    for (const tc of cases) {
+      executed.length = 0;
+      faux.setResponses([fauxAssistantMessage(fauxText(`static-${tc.pullNumber}`))]);
+      const deliveryId = `delivery-fork-${tc.pullNumber}`;
+      const body = JSON.stringify({
+        action: "opened",
+        number: tc.pullNumber,
+        pull_request: {
+          number: tc.pullNumber,
+          base: { sha: "base000", ref: "main", repo: tc.baseRepo },
+          head: { sha: tc.sha, ref: "patch-1", repo: tc.headRepo },
+        },
+        repository: { id: 100, full_name: "octo/repo", default_branch: "main" },
+        installation: { id: 777 },
+      });
+
+      const res = await SELF.fetch("https://example.com/webhook/github", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-github-event": "pull_request",
+          "x-github-delivery": deliveryId,
+          "x-hub-signature-256": await signPayload(body),
+        },
+        body,
+      });
+
+      expect(res.status, tc.label).toBe(202);
+      const orchestrator = env.ORCHESTRATOR.getByName(`octo/repo#${tc.pullNumber}`);
+      await expect(orchestrator.result(deliveryId)).resolves.toMatchObject({
+        status: "done",
+        text: `static-${tc.pullNumber}`,
+      });
+      await expect(orchestrator.step1Status(deliveryId)).resolves.toMatchObject({
+        isFork: true,
+        executionMode: "static_only",
+        staticOnlyReason: "fork_pr",
+      });
+      expect(executed, tc.label).toHaveLength(0);
+    }
+  });
+
+  it("Webhook ボディサイズが上限（MAX_WEBHOOK_BODY_BYTES）ちょうどは受理し、1 バイト超過時は 413 でレビューを開始しない", async () => {
+    installDefaultGitHubMock({ headShaByPull: { 610: "sha-exact-limit", 611: "sha-over-limit" } });
+    faux.setResponses([fauxAssistantMessage(fauxText("exact-limit-ok"))]);
+    const callsBefore = faux.state.callCount;
+
+    const baseJson = makePullRequestPayload("opened", "octo/repo", 610, "sha-exact-limit");
+    const encoder = new TextEncoder();
+    const baseBytes = encoder.encode(baseJson).byteLength;
+    const exactBody = baseJson + " ".repeat(MAX_WEBHOOK_BODY_BYTES - baseBytes);
+    expect(encoder.encode(exactBody).byteLength).toBe(MAX_WEBHOOK_BODY_BYTES);
+
+    const exactRes = await SELF.fetch("https://example.com/webhook/github", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "pull_request",
+        "x-github-delivery": "delivery-exact-2mib",
+        "x-hub-signature-256": await signPayload(exactBody),
+      },
+      body: exactBody,
+    });
+    expect(exactRes.status).toBe(202);
+    const orchestrator = env.ORCHESTRATOR.getByName("octo/repo#610");
+    await expect(orchestrator.result("delivery-exact-2mib")).resolves.toMatchObject({
+      status: "done",
+      text: "exact-limit-ok",
+    });
+    expect(faux.state.callCount).toBe(callsBefore + 1);
+
+    const overBaseJson = makePullRequestPayload("opened", "octo/repo", 611, "sha-over-limit");
+    const overBaseBytes = encoder.encode(overBaseJson).byteLength;
+    const overBody = overBaseJson + " ".repeat(MAX_WEBHOOK_BODY_BYTES - overBaseBytes + 1);
+    expect(encoder.encode(overBody).byteLength).toBe(MAX_WEBHOOK_BODY_BYTES + 1);
+
+    const overRes = await SELF.fetch("https://example.com/webhook/github", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "pull_request",
+        "x-github-delivery": "delivery-over-2mib",
+        "x-hub-signature-256": await signPayload(overBody),
+      },
+      body: overBody,
+    });
+    expect(overRes.status).toBe(413);
+    await expect(overRes.json()).resolves.toEqual({ ok: false, reason: "payload too large" });
+    expect(faux.state.callCount).toBe(callsBefore + 1);
+  });
+
+  it("check_suite の通知対象 PR はちょうど MAX_CHECK_SUITE_PULL_REQUESTS 件まで許可し、上限超過分は打ち切る", async () => {
+    const exactPrs = Array.from({ length: MAX_CHECK_SUITE_PULL_REQUESTS }, (_, idx) => ({
+      number: 700 + idx,
+      baseRepoId: 100,
+    }));
+    const exactSuiteBody = makeCheckSuitePayload({
+      headSha: "sha-suite-20",
+      appId: 10,
+      pullRequests: exactPrs,
+    });
+    const exactRes = await SELF.fetch("https://example.com/webhook/github", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "check_suite",
+        "x-github-delivery": "delivery-cs-exact-20",
+        "x-hub-signature-256": await signPayload(exactSuiteBody),
+      },
+      body: exactSuiteBody,
+    });
+    expect(exactRes.status).toBe(202);
+    await expect(exactRes.json()).resolves.toEqual({
+      ok: true,
+      deliveryId: "delivery-cs-exact-20",
+      notifiedPullNumbers: exactPrs.map((pr) => pr.number),
+      wokenPullNumbers: [],
+    });
+
+    // 21 件目の PR (#770) を awaiting_ci で待機させ、上限超過時は通知対象に含まれず起床しないことを検証
+    let ciState: "in_progress" | "passed" = "in_progress";
+    installDefaultGitHubMock({
+      headShaByPull: { 770: "sha-suite-over" },
+      checkStatusBySha: () => ({ "sha-suite-over": ciState }),
+    });
+    sandboxTestConfig.ciPollIntervalMs = 60_000;
+    sandboxTestConfig.ciWaitTimeoutMs = 300_000;
+
+    const openBody = makePullRequestPayload("opened", "octo/repo", 770, "sha-suite-over");
+    await SELF.fetch("https://example.com/webhook/github", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "pull_request",
+        "x-github-delivery": "delivery-await-770",
+        "x-hub-signature-256": await signPayload(openBody),
+      },
+      body: openBody,
+    });
+    const pr21 = env.ORCHESTRATOR.getByName("octo/repo#770");
+    await expect(pr21.step1Status("delivery-await-770")).resolves.toMatchObject({
+      stage: "awaiting_ci",
+    });
+
+    ciState = "passed";
+    const overPrs = [
+      ...Array.from({ length: MAX_CHECK_SUITE_PULL_REQUESTS }, (_, idx) => ({
+        number: 750 + idx,
+        baseRepoId: 100,
+      })),
+      { number: 770, baseRepoId: 100 },
+      { number: 771, baseRepoId: 100 },
+    ];
+    const overSuiteBody = makeCheckSuitePayload({
+      headSha: "sha-suite-over",
+      appId: 10,
+      pullRequests: overPrs,
+    });
+    const overRes = await SELF.fetch("https://example.com/webhook/github", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "check_suite",
+        "x-github-delivery": "delivery-cs-over-20",
+        "x-hub-signature-256": await signPayload(overSuiteBody),
+      },
+      body: overSuiteBody,
+    });
+    expect(overRes.status).toBe(202);
+    const overJson = (await overRes.json()) as {
+      ok: boolean;
+      notifiedPullNumbers: number[];
+      wokenPullNumbers: number[];
+    };
+    expect(overJson.ok).toBe(true);
+    expect(overJson.notifiedPullNumbers).toHaveLength(MAX_CHECK_SUITE_PULL_REQUESTS);
+    expect(overJson.notifiedPullNumbers).not.toContain(770);
+    expect(overJson.notifiedPullNumbers).not.toContain(771);
+    expect(overJson.wokenPullNumbers).toEqual([]);
+    await expect(pr21.step1Status("delivery-await-770")).resolves.toMatchObject({
+      stage: "awaiting_ci",
+    });
+  });
+});
+
+describe("resolveWebhookIsFork", () => {
+  it("head=null・id 不一致・full_name 不一致・判定材料欠落を fail-closed で true と判定する", () => {
+    // 1. head.repo === null（削除済みフォーク）
+    expect(resolveWebhookIsFork({ id: 100, full_name: "octo/repo" }, null)).toBe(true);
+    expect(resolveWebhookIsFork(undefined, null)).toBe(true);
+
+    // 2. id 不一致（full_name が一致していても true）
+    expect(
+      resolveWebhookIsFork(
+        { id: 100, full_name: "octo/repo" },
+        { id: 200, full_name: "octo/repo" },
+      ),
+    ).toBe(true);
+    expect(
+      resolveWebhookIsFork({ id: 100, full_name: "octo/repo" }, { id: 200, full_name: "eve/repo" }),
+    ).toBe(true);
+
+    // 3. full_name 不一致（id が一致していても true）
+    expect(
+      resolveWebhookIsFork({ id: 100, full_name: "octo/repo" }, { id: 100, full_name: "eve/repo" }),
+    ).toBe(true);
+    expect(resolveWebhookIsFork({ full_name: "octo/repo" }, { full_name: "eve/repo" })).toBe(true);
+
+    // 4. 判定材料欠落（片方の id や full_name が欠落・非正数・空文字）-> fail-closed で true
+    expect(
+      resolveWebhookIsFork({ id: 100, full_name: "octo/repo" }, { full_name: "octo/repo" }),
+    ).toBe(true);
+    expect(resolveWebhookIsFork({ id: 100, full_name: "octo/repo" }, { id: 100 })).toBe(true);
+    expect(
+      resolveWebhookIsFork({ id: 0, full_name: "octo/repo" }, { id: 0, full_name: "octo/repo" }),
+    ).toBe(true);
+    expect(resolveWebhookIsFork({}, {})).toBe(true);
+
+    // 5. baseRepo または headRepo 自体が未指定 -> Step 0 に委ねるため undefined
+    expect(resolveWebhookIsFork(undefined, { id: 100, full_name: "octo/repo" })).toBeUndefined();
+    expect(resolveWebhookIsFork(null, { id: 100, full_name: "octo/repo" })).toBeUndefined();
+    expect(resolveWebhookIsFork({ id: 100, full_name: "octo/repo" }, undefined)).toBeUndefined();
+
+    // 6. 正の id と full_name（大文字小文字無視）が両方一致した内部 PR のみ false
+    expect(
+      resolveWebhookIsFork(
+        { id: 100, full_name: "Octo/Repo" },
+        { id: 100, full_name: "octo/repo" },
+      ),
+    ).toBe(false);
   });
 });
