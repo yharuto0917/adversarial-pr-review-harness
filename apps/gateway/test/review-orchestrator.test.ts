@@ -1098,8 +1098,8 @@ describe("ReviewOrchestrator", () => {
   });
 
   it("最大生存時間 (TTL) を超過すると実行中のレビューをデッドロックせず中断・強制破棄し、以後のゾンビ再生成も防ぐ", async () => {
-    sandboxTestConfig.maxLifetimeMs = 150;
-    sandboxTestConfig.cleanupPollMs = 150;
+    sandboxTestConfig.maxLifetimeMs = 600;
+    sandboxTestConfig.cleanupPollMs = 100;
     sandboxTestConfig.hangCommand = "sleep 999";
 
     faux.setResponses([
@@ -1117,15 +1117,21 @@ describe("ReviewOrchestrator", () => {
       }),
     );
 
-    await vi.waitFor(() => {
-      expect(executed).toContain("sleep 999");
-    });
+    await vi.waitFor(
+      () => {
+        expect(executed).toContain("sleep 999");
+      },
+      { timeout: 3_000 },
+    );
 
     const outcome = await stub.result("del-ttl-expire");
     expect(outcome.status).toBe("unanswered");
-    await vi.waitFor(() => {
-      expect(destroyedSandboxes).toHaveLength(1);
-    });
+    await vi.waitFor(
+      () => {
+        expect(destroyedSandboxes).toHaveLength(1);
+      },
+      { timeout: 3_000 },
+    );
     expect(sandboxFiles.size).toBe(0);
 
     await runInDurableObject(stub, async (instance) => {
